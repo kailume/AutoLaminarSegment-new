@@ -25,6 +25,23 @@ import matplotlib.pyplot as plt
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
+IMAGE_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".jp2", ".j2k"
+)
+
+
+def resolve_image_path(directory: Path, filename: str) -> Path:
+    base = directory / filename
+    if base.exists():
+        return base
+
+    stem = base.stem if base.suffix else base.name
+    for ext in IMAGE_EXTENSIONS:
+        for suffix in (ext, ext.upper()):
+            candidate = base.parent / f"{stem}{suffix}"
+            if candidate.exists():
+                return candidate
+    return base
 
 
 class LayerResultAnalyzer:
@@ -46,9 +63,10 @@ class LayerResultAnalyzer:
         'L5/6': (255, 255, 100),
     }
     
-    def __init__(self, output_dir="output", input_dir="input"):
+    def __init__(self, output_dir="output", input_dir="input", groundtruth_path=None):
         self.output_dir = Path(output_dir)
         self.input_dir = Path(input_dir)
+        self.groundtruth_path = Path(groundtruth_path) if groundtruth_path else None
         
         # 加载图像
         self.algo_mask = None
@@ -63,8 +81,12 @@ class LayerResultAnalyzer:
     
     def load_images(self):
         """加载算法输出和ground truth图像"""
-        algo_path = self.output_dir / "layers_color_mask.png"
-        gt_path = self.input_dir / "groundtruth.png"
+        algo_path = resolve_image_path(self.output_dir, "layers_color_mask.png")
+        if self.groundtruth_path is not None:
+            gt_path = self.groundtruth_path
+        else:
+            gt_path = resolve_image_path(self.input_dir, "groundtruth.png")
+
         
         if not algo_path.exists():
             raise FileNotFoundError(f"算法输出文件不存在: {algo_path}")

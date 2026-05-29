@@ -1,0 +1,2 @@
+python segment_large_mage_fast.py <image.tif> --tile-size 4096 --no-tta
+# 更大的tilesize + 取消多尺度重采样（边界精度下降）

@@ -1,1573 +1,813 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.spatial.distance import cdist
-from sklearn.neighbors import NearestNeighbors
-import seaborn as sns
+"""
+精简版密度分层算法模块。
+
+本文件只保留后续分层流程真正需要的核心算法：
+
+1. 读取并规范化输入数据：
+   - WM/GM 边界点：必须包含 x, y 坐标列；
+   - 细胞中心点：兼容 X/Y、x/y、centroid_x/centroid_y。
+2. 对每个细胞计算归一化深度：
+   - legacy: depth = dist_to_GM / (dist_to_GM + dist_to_WM)
+   - harmonic: 在 GM=0、WM=1 的边界条件下求解调和深度场
+   - GM 边界附近 depth 接近 0，WM 边界附近 depth 接近 1。
+3. 用 KDE 估计每个细胞位置的局部密度。
+4. 按 depth 分箱，得到 depth-density 曲线。
+5. 使用 peak-based 方法自动推断皮层分层边界。
+6. 保存算法诊断图 depth_density_layers_peak_based.png。
+
+主要对外函数：
+    analyze()
+        输入 WM/GM 边界和细胞坐标，输出按深度排序的 depth 与 density。
+
+    computeAverage()
+        输入细胞级 depth/density，输出分箱后的平均密度曲线。
+
+    segmentLayer_peak_based()
+        输入 depth-density 曲线，输出最终层边界列表。
+"""
+
 import os
 
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.mixture import GaussianMixture
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import find_peaks, argrelextrema
+from scipy.interpolate import RegularGridInterpolator
+from scipy.signal import find_peaks
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
+from scipy.stats import gaussian_kde
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-plt.rcParams['axes.unicode_minus'] = False   # 用来正常显示负号
 
-# 默认输出路径
+# run_pipeline.py 会在运行时覆盖该模块级变量，用于控制算法图保存目录。
 output_dir = "output"
+DEPTH_METHOD = "legacy"      # "legacy" = 最近边界距离；"harmonic" = GM/WM 之间的调和深度场
+HARMONIC_MAX_DIM = 1024      # harmonic 深度场网格最长边，越大越精细但越慢
 
-def calculate_cell_density(cells, radius=100):
-    coords = cells[['X', 'Y']].values
-    
-    # 使用NearestNeighbors计算密度
-    nbrs = NearestNeighbors(radius=radius).fit(coords)
-    densities = []
-    
-    for coord in coords:
-        # 找到半径内的所有邻居
-        indices = nbrs.radius_neighbors([coord], return_distance=False)[0]
-        # 密度为邻居数量除以圆形区域面积
-        # density = len(indices) / (np.pi * radius**2)
-        density = len(indices)
-        densities.append(density)
-    
-    return np.array(densities)
 
-def radiustocorrelation(cells, depth, isshow=True):
-    # 测试不同半径对相关性的影响
-    multi_density = {}
-    multi_correlation = {}
-    radius_list = [10, 20, 30, 50, 100, 150, 200, 300, 500]
-    best_radius = 100
-    for radius in range(10, 201, 10):
-    # for radius in radius_list:
-        density = calculate_cell_density(cells, radius=radius)
-        correlation = np.corrcoef(depth, density)[0, 1]
-        multi_density[radius] = density
-        multi_correlation[radius] = correlation
-        if abs(correlation) > abs(multi_correlation.get(best_radius, 0)):
-            best_radius = radius
-    if isshow:
-        plt.figure(figsize=(10, 6))
-        plt.plot(list(multi_correlation.keys()), list(multi_correlation.values()), marker='o')
-        plt.xlabel('Radius for Density Calculation', fontsize=12)
-        plt.ylabel('Correlation between Depth and Density', fontsize=12)
-        plt.title('Correlation vs Radius for Density Calculation', fontsize=14)
-        plt.grid()
-        plt.show()
-    
-    print(f"best radius: {best_radius}, correlation: {multi_correlation[best_radius]:.3f}")
-    return best_radius
+def _ensure_xy_dataframe(data):
+    """
+    将细胞坐标数据统一整理为包含 X、Y 两列的 DataFrame。
 
-def analyze(wm, gm, cell):
-    # 读取数据文件
-    if isinstance(wm, str):
-        boundary_W = pd.read_csv(wm)
+    参数:
+        data:
+            可以是 CSV 文件路径，也可以是 pandas.DataFrame。
+            支持的列名包括：
+            - X, Y
+            - x, y
+            - centroid_x, centroid_y
+
+    返回:
+        pandas.DataFrame
+            只包含两列：X, Y。
+
+    说明:
+        后续所有几何计算都使用 X/Y 表示细胞中心点在 DAPI/40x 图像中的像素坐标。
+    """
+    if isinstance(data, str):
+        df = pd.read_csv(data)
     else:
-        boundary_W = wm
-        
-    if isinstance(gm, str):
-        boundary_G = pd.read_csv(gm)
-    else:
-        boundary_G = gm
-        
-    if isinstance(cell, str):
-        cells = pd.read_csv(cell)
-    else:
-        cells = cell
-    
-    print(f"Boundary W points: {len(boundary_W)}")
-    print(f"Boundary G points: {len(boundary_G)}")
-    print(f"Number of cells: {len(cells)}")
-    
-    # 计算每个细胞到两个边界的最小距离
-    w_dist = cdist(cells[['X', 'Y']].values, boundary_W[['x', 'y']].values)
-    dist_to_W = np.min(w_dist, axis=1)
-    g_dist = cdist(cells[['X', 'Y']].values, boundary_G[['x', 'y']].values)
-    dist_to_G = np.min(g_dist, axis=1)
-    # 计算深度
-    depth = dist_to_G / (dist_to_W + dist_to_G + 1e-8)
-    
-    # radius = radiustocorrelation(cells, depth, isshow=True)
-    # radius = 100
-    # radius=500
-    radius = 300 # 40x 50μm
+        df = data.copy()
 
-    # 计算细胞密度
-    density = calculate_cell_density(cells, radius=radius)
-
-    # 对深度和密度数据进行排序
-    sorted_indices = np.argsort(depth)
-    depth = depth[sorted_indices]
-    density = density[sorted_indices]
-    # density = gaussian_filter1d(density, sigma=2)
-
-    # 计算相关系数
-    correlation = np.corrcoef(depth, density)[0, 1]
-
-    # 打印统计信息
-    print("\n统计信息:")
-    print(f"深度范围: {depth.min():.3f} - {depth.max():.3f}")
-    print(f"深度均值: {depth.mean():.3f}")
-    print(f"密度范围: {density.min():.6f} - {density.max():.6f}")
-    print(f"密度均值: {density.mean():.6f}")
-    print(f"深度与密度的相关系数: {correlation:.3f}")
-
-    return depth, density
-
-def visualize(depth, density, issave=True):
-    # 创建二维直方图
-    # fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # ax_main = axes[0, 0]
-    # h = ax_main.hist2d(depth, density, bins=50, cmap='viridis', alpha=0.8)
-    # ax_main.set_xlabel('Depth to outer boundary', fontsize=12)
-    # ax_main.set_ylabel('Density', fontsize=12)
-    # ax_main.set_title('Depth vs Density', fontsize=14)
-    # plt.colorbar(h[3], ax=ax_main, label='Cell Count')
-    
-    # # 深度的边际分布
-    # ax_depth = axes[0, 1]
-    # ax_depth.hist(depth, bins=50, alpha=0.7, color='blue', edgecolor='black')
-    # ax_depth.set_xlabel('Cell Depth', fontsize=12)
-    # ax_depth.set_ylabel('Frequency', fontsize=12)
-    # ax_depth.set_title('Depth Distribution', fontsize=14)
-    
-    # # 密度的边际分布
-    # ax_density = axes[1, 0]
-    # ax_density.hist(density, bins=50, alpha=0.7, color='red', edgecolor='black')
-    # ax_density.set_xlabel('Cell Density', fontsize=12)
-    # ax_density.set_ylabel('Frequency', fontsize=12)
-    # ax_density.set_title('Density Distribution', fontsize=14)
-    
-    # 散点图，尺寸为8x6
-    plt.figure(figsize=(8, 5))
-    plt.scatter(depth, density, c=density, alpha=0.6, s=10)
-    # scatter = plt.scatter(depth, density, c=density, cmap='plasma', alpha=0.6, s=10)
-    plt.xlabel('Depth', fontsize=12)
-    plt.ylabel('Density', fontsize=12)
-    plt.title('Depth-Density Scatter Plot', fontsize=14)
-    # plt.colorbar(scatter, label='Density')
-    
-    plt.tight_layout()
-    if issave: plt.savefig(os.path.join(output_dir, 'depth_density_scatter.png'))
-    plt.show(block=True)
-    
-    # # 使用seaborn创建更美观的联合分布图
-    # # 创建数据框
-    # data_df = pd.DataFrame({
-    #     'depth': depth,
-    #     'density': density
-    # })
-    # # 绘制联合分布图
-    # g = sns.JointGrid(data=data_df, x='depth', y='density', height=8)
-    # # 主图：二维直方图
-    # g.plot_joint(plt.hexbin, gridsize=30, cmap='Blues')
-    # # 边际图：直方图
-    # g.plot_marginals(sns.histplot, kde=True)
-    # # 设置标签
-    # g.set_axis_labels('Cell Depth (Relative to Boundary B)', 'Cell Density', fontsize=12)
-    # plt.suptitle('Joint Distribution of Cell Depth and Density', fontsize=14, y=1.02)
-    # plt.show()
-
-def computeAverage(depth, density, isshow=True, issave=True, mode='average', issmooth=True):
-    bins = np.arange(0, 1.01, 0.02)
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    avg_density = []
-    for i in range(len(bins)-1):
-        mask = (depth >= bins[i]) & (depth < bins[i+1])
-        if np.sum(mask) > 0:
-            if mode == 'average':
-                avg_density.append(np.mean(density[mask]))
-            elif mode == 'median':
-                avg_density.append(np.median(density[mask]))
+    cols_lower = {c.lower(): c for c in df.columns}
+    x_col = cols_lower.get("x") or cols_lower.get("centroid_x")
+    y_col = cols_lower.get("y") or cols_lower.get("centroid_y")
+    if x_col is None or y_col is None:
+        if "X" in df.columns and "Y" in df.columns:
+            x_col, y_col = "X", "Y"
         else:
-            avg_density.append(0)
-    avg_density = np.array(avg_density)
-    if issmooth: 
-        avg_density = gaussian_filter1d(avg_density, sigma=2)
-    if isshow:
-        # 把每个点连接起来
-        plt.figure(figsize=(8, 6))
-        plt.plot(bin_centers, avg_density, marker='o')
-        plt.xlabel('Depth (pial to white)', fontsize=12)
-        plt.ylabel('Average Cell Density', fontsize=12)
-        plt.title('Average Cell Density vs Depth', fontsize=14)
-        plt.grid()
-        if issave: plt.savefig(os.path.join(output_dir, f'depth-{mode}-density.png'))
-        plt.show(block=True)
+            raise ValueError(f"Cannot find cell coordinate columns in {list(df.columns)}")
 
-        # # 把平均密度曲线叠加在原始散点图上
-        # plt.figure(figsize=(8, 5))
-        # plt.scatter(depth, density, c=density, alpha=0.6, s=10)
-        # plt.plot(bin_centers, avg_density, color='red')
-        # plt.xlabel('Depth', fontsize=12)
-        # plt.ylabel('Density', fontsize=12)
-        # plt.title('Depth-Density Scatter Plot with Average Curve', fontsize=14)
-        # plt.tight_layout()
-        # if issave: plt.savefig(f'IO\\OUTPUT\\depth_density_scatter_with_avg.png')
-        # plt.show()
+    out = df[[x_col, y_col]].copy()
+    out.columns = ["X", "Y"]
+    return out
+
+
+def _ensure_boundary_dataframe(data):
+    """
+    将边界坐标数据统一整理为包含 x、y 两列的 DataFrame。
+
+    参数:
+        data:
+            可以是 CSV 文件路径，也可以是 pandas.DataFrame。
+            必须包含 x/y 坐标列，不接受 centroid_x/centroid_y。
+
+    返回:
+        pandas.DataFrame
+            只包含两列：x, y。
+
+    说明:
+        GM 和 WM 边界都应已经处于 DAPI/40x 图像坐标系。
+    """
+    if isinstance(data, str):
+        df = pd.read_csv(data)
+    else:
+        df = data.copy()
+
+    cols_lower = {c.lower(): c for c in df.columns}
+    x_col = cols_lower.get("x")
+    y_col = cols_lower.get("y")
+    if x_col is None or y_col is None:
+        raise ValueError(f"Boundary data must contain x/y columns, got {list(df.columns)}")
+
+    out = df[[x_col, y_col]].copy()
+    out.columns = ["x", "y"]
+    return out
+
+
+def _nearest_boundary_depths(wm, gm, cells):
+    """
+    基于最近边界距离计算每个细胞的归一化深度。
+
+    参数:
+        wm:
+            白质边界点 DataFrame，列为 x, y。
+        gm:
+            灰质外边界点 DataFrame，列为 x, y。
+        cells:
+            细胞中心点 DataFrame，列为 X, Y。
+
+    返回:
+        numpy.ndarray
+            每个细胞的 depth，范围大致为 0 到 1。
+
+    算法:
+        1. 分别为 WM 和 GM 边界点建立 KDTree；
+        2. 查询每个细胞到最近 WM 点和最近 GM 点的距离；
+        3. 用 dist_to_GM / (dist_to_GM + dist_to_WM) 归一化。
+
+    depth 含义:
+        - 接近 GM 边界：dist_to_GM 小，depth 接近 0；
+        - 接近 WM 边界：dist_to_WM 小，depth 接近 1。
+    """
+    wm_points = wm[["x", "y"]].to_numpy(dtype=float)
+    gm_points = gm[["x", "y"]].to_numpy(dtype=float)
+    cell_points = cells[["X", "Y"]].to_numpy(dtype=float)
+
+    dist_to_wm, _ = cKDTree(wm_points).query(cell_points, k=1)
+    dist_to_gm, _ = cKDTree(gm_points).query(cell_points, k=1)
+    return dist_to_gm / (dist_to_gm + dist_to_wm + 1e-8)
+
+
+def _build_boundary_lookup(points):
+    """Build a robust y=f(x) lookup from boundary points for harmonic depth."""
+    pts = np.asarray(points, dtype=float)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if len(pts) == 0:
+        return lambda x: np.full_like(np.asarray(x, dtype=float), np.nan, dtype=float)
+
+    df = pd.DataFrame(pts, columns=["x", "y"])
+    grouped = df.groupby("x", as_index=False)["y"].median().sort_values("x")
+    x_vals = grouped["x"].to_numpy(dtype=float)
+    y_vals = grouped["y"].to_numpy(dtype=float)
+
+    if len(x_vals) == 1:
+        return lambda x: np.full_like(np.asarray(x, dtype=float), y_vals[0], dtype=float)
+
+    def _lookup(x_new):
+        x_arr = np.asarray(x_new, dtype=float)
+        clipped = np.clip(x_arr, x_vals[0], x_vals[-1])
+        return np.interp(clipped, x_vals, y_vals)
+
+    return _lookup
+
+
+def _choose_harmonic_scale(width, height, max_dim=1024):
+    longest = max(width, height)
+    return max(1, int(np.ceil(longest / max_dim)))
+
+
+def _harmonic_boundary_depths(wm, gm, cells, max_dim=1024):
+    """
+    Compute normalized cortical depth by solving a harmonic field between GM and WM.
+
+    GM boundary is fixed to 0, WM boundary is fixed to 1. Cell depth is sampled
+    from the solved Laplace field. Points outside the field fall back to legacy.
+    """
+    wm_points = wm[["x", "y"]].to_numpy(dtype=float)
+    gm_points = gm[["x", "y"]].to_numpy(dtype=float)
+    cell_points = cells[["X", "Y"]].to_numpy(dtype=float)
+
+    all_points = np.vstack([wm_points, gm_points, cell_points])
+    min_x = int(np.floor(all_points[:, 0].min()))
+    max_x = int(np.ceil(all_points[:, 0].max()))
+    min_y = int(np.floor(all_points[:, 1].min()))
+    max_y = int(np.ceil(all_points[:, 1].max()))
+
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+    scale = _choose_harmonic_scale(width, height, max_dim=max_dim)
+
+    xs_full = np.arange(min_x, max_x + 1, scale, dtype=float)
+    ys_full = np.arange(min_y, max_y + 1, scale, dtype=float)
+    if xs_full[-1] != max_x:
+        xs_full = np.append(xs_full, float(max_x))
+    if ys_full[-1] != max_y:
+        ys_full = np.append(ys_full, float(max_y))
+
+    gm_y = _build_boundary_lookup(gm_points)(xs_full)
+    wm_y = _build_boundary_lookup(wm_points)(xs_full)
+
+    h = len(ys_full)
+    w = len(xs_full)
+    domain_mask = np.zeros((h, w), dtype=bool)
+    gm_mask = np.zeros((h, w), dtype=bool)
+    wm_mask = np.zeros((h, w), dtype=bool)
+
+    for ix in range(w):
+        gy = float(gm_y[ix])
+        wy = float(wm_y[ix])
+        if not np.isfinite(gy) or not np.isfinite(wy):
+            continue
+
+        top_y = min(gy, wy)
+        bottom_y = max(gy, wy)
+        y_start = int(np.searchsorted(ys_full, top_y, side="left"))
+        y_end = int(np.searchsorted(ys_full, bottom_y, side="right")) - 1
+        if y_start > y_end or y_start >= h or y_end < 0:
+            continue
+
+        y_start = max(0, y_start)
+        y_end = min(h - 1, y_end)
+        domain_mask[y_start : y_end + 1, ix] = True
+
+        gm_idx = int(np.argmin(np.abs(ys_full - gy)))
+        wm_idx = int(np.argmin(np.abs(ys_full - wy)))
+        gm_mask[gm_idx, ix] = True
+        wm_mask[wm_idx, ix] = True
+        domain_mask[gm_idx, ix] = True
+        domain_mask[wm_idx, ix] = True
+
+    if not np.any(domain_mask):
+        raise RuntimeError("Failed to build a valid cortical ribbon for harmonic depth computation.")
+
+    known_mask = gm_mask | wm_mask
+    unknown_mask = domain_mask & (~known_mask)
+    unknown_indices = np.argwhere(unknown_mask)
+
+    field = np.full((h, w), np.nan, dtype=np.float64)
+    field[gm_mask] = 0.0
+    field[wm_mask] = 1.0
+
+    if len(unknown_indices) > 0:
+        index_map = -np.ones((h, w), dtype=np.int32)
+        for idx, (iy, ix) in enumerate(unknown_indices):
+            index_map[iy, ix] = idx
+
+        matrix = lil_matrix((len(unknown_indices), len(unknown_indices)), dtype=np.float64)
+        rhs = np.zeros(len(unknown_indices), dtype=np.float64)
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        for row, (iy, ix) in enumerate(unknown_indices):
+            degree = 0
+            for dy, dx in neighbors:
+                ny = iy + dy
+                nx = ix + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w or not domain_mask[ny, nx]:
+                    continue
+                degree += 1
+                if unknown_mask[ny, nx]:
+                    matrix[row, index_map[ny, nx]] = -1.0
+                else:
+                    rhs[row] += field[ny, nx]
+            matrix[row, row] = max(degree, 1)
+
+        field[unknown_mask] = spsolve(matrix.tocsr(), rhs)
+
+    field = np.clip(field, 0.0, 1.0)
+    domain_values = field[domain_mask]
+    if np.any(np.isfinite(domain_values)):
+        dmin = float(np.nanmin(domain_values))
+        dmax = float(np.nanmax(domain_values))
+        if dmax > dmin:
+            field[domain_mask] = (field[domain_mask] - dmin) / (dmax - dmin)
+
+    interpolator = RegularGridInterpolator(
+        (ys_full, xs_full),
+        field,
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    sample_points = np.column_stack([cell_points[:, 1], cell_points[:, 0]])
+    depth = interpolator(sample_points)
+
+    invalid = ~np.isfinite(depth)
+    if np.any(invalid):
+        legacy_depth = _nearest_boundary_depths(wm, gm, cells)
+        depth[invalid] = legacy_depth[invalid]
+
+    return depth.astype(float)
+
+
+def _kde_density(cells, bandwidth="scott"):
+    """
+    使用二维高斯核密度估计计算每个细胞位置的局部密度。
+
+    参数:
+        cells:
+            细胞中心点 DataFrame，列为 X, Y。
+        bandwidth:
+            scipy.stats.gaussian_kde 的 bw_method 参数。
+            常用取值：
+            - "scott"：默认，按 Scott 规则自动估计带宽；
+            - "silverman"：按 Silverman 规则估计带宽；
+            - float：手动指定相对带宽因子。
+
+    返回:
+        numpy.ndarray
+            与细胞一一对应的密度值。
+
+    说明:
+        gaussian_kde 输出的是概率密度量级。这里乘以 sqrt(n) 做简单缩放，
+        使数值更接近“局部细胞密度强度”，方便后续曲线比较。
+    """
+    coords = cells[["X", "Y"]].to_numpy(dtype=float).T
+    n = coords.shape[1]
+    if n < 2:
+        return np.ones(n, dtype=float)
+
+    kde = gaussian_kde(coords, bw_method=bandwidth)
+    density = kde(coords)
+    scale_factor = n / np.sqrt(n)
+    return np.asarray(density * scale_factor, dtype=float)
+
+
+def analyze(wm, gm, cell, kde_bandwidth="scott", depth_method=None, harmonic_max_dim=None, **_ignored):
+    """
+    计算细胞级深度和密度，并按深度从浅到深排序。
+
+    参数:
+        wm:
+            WM 边界数据，CSV 路径或 DataFrame，包含 x/y。
+        gm:
+            GM 边界数据，CSV 路径或 DataFrame，包含 x/y。
+        cell:
+            细胞中心点数据，CSV 路径或 DataFrame。
+        kde_bandwidth:
+            KDE 带宽参数，传给 _kde_density()。
+        depth_method:
+            深度计算方式；"legacy" 使用最近 GM/WM 边界距离，"harmonic" 使用调和深度场。
+            None 时使用模块级 DEPTH_METHOD。
+        harmonic_max_dim:
+            harmonic 深度场网格最长边，None 时使用模块级 HARMONIC_MAX_DIM。
+        **_ignored:
+            兼容旧 run_pipeline.py 调用保留的冗余参数入口。
+
+    返回:
+        tuple[numpy.ndarray, numpy.ndarray]
+            depth_sorted:
+                按深度升序排列的细胞 depth。
+            density_sorted:
+                与 depth_sorted 对齐的细胞密度。
+    """
+    # 统一输入列名，避免下游几何计算反复判断列名。
+    boundary_wm = _ensure_boundary_dataframe(wm)
+    boundary_gm = _ensure_boundary_dataframe(gm)
+    cells = _ensure_xy_dataframe(cell)
+
+    if depth_method is None:
+        depth_method = DEPTH_METHOD
+    depth_method = str(depth_method).lower()
+    harmonic_max_dim = HARMONIC_MAX_DIM if harmonic_max_dim is None else harmonic_max_dim
+
+    # 先计算细胞深度，再计算细胞位置的 KDE 密度。
+    if depth_method == "legacy":
+        depth = _nearest_boundary_depths(boundary_wm, boundary_gm, cells)
+    elif depth_method == "harmonic":
+        depth = _harmonic_boundary_depths(
+            boundary_wm,
+            boundary_gm,
+            cells,
+            max_dim=harmonic_max_dim,
+        )
+    else:
+        raise ValueError(f"Unknown depth_method: {depth_method}. Use 'legacy' or 'harmonic'.")
+    print(f"Depth method: {depth_method}")
+    density = _kde_density(cells, bandwidth=kde_bandwidth)
+
+    # 后续分箱和分层都假设 depth 从 0 到 1 单调排列。
+    order = np.argsort(depth)
+    return depth[order], density[order]
+
+
+def computeAverage(depth, density, mode="average", bin_width=0.02, **_ignored):
+    """
+    将细胞级 density 按 depth 分箱，生成 depth-density 曲线。
+
+    参数:
+        depth:
+            每个细胞的归一化深度，一维数组。
+        density:
+            每个细胞的局部密度，一维数组，与 depth 等长。
+        mode:
+            每个 depth bin 内的统计方式：
+            - "average"：取平均值；
+            - "median"：取中位数。
+        bin_width:
+            depth 分箱宽度。默认 0.02，即 0~1 共 50 个 bin。
+        **_ignored:
+            兼容旧版本 isshow、issave、issmooth 等参数；精简版不使用。
+
+    返回:
+        tuple[numpy.ndarray, numpy.ndarray]
+            avg_density:
+                每个 depth bin 内的平均/中位密度。
+            bin_centers:
+                每个 bin 的中心 depth 值。
+
+    说明:
+        这一步把离散细胞点转成连续深度方向上的密度曲线，
+        peak-based 分层就是基于这条曲线完成的。
+    """
+    depth = np.asarray(depth, dtype=float)
+    density = np.asarray(density, dtype=float)
+
+    bins = np.arange(0.0, 1.0 + bin_width, bin_width)
+    bin_centers = (bins[:-1] + bins[1:]) / 2.0
+    avg_density = np.zeros_like(bin_centers, dtype=float)
+
+    for i in range(len(bin_centers)):
+        # 最后一个 bin 包含右端点 1.0，避免 depth == 1 的细胞被漏掉。
+        in_bin = (depth >= bins[i]) & (depth < bins[i + 1])
+        if i == len(bin_centers) - 1:
+            in_bin = (depth >= bins[i]) & (depth <= bins[i + 1])
+        if not np.any(in_bin):
+            continue
+        if mode == "median":
+            avg_density[i] = float(np.median(density[in_bin]))
+        else:
+            avg_density[i] = float(np.mean(density[in_bin]))
 
     return avg_density, bin_centers
 
-def _labels_to_layers(labels, depth_list, avg_density, n_clusters):
+
+def _zero_crossing_depths(values, depth_sorted):
     """
-    将聚类标签转换为分层结果的辅助函数
-    """
-    # 将簇按深度中心排序，保证层号与深度呈单调关系（从浅到深）
-    cluster_mean_depth = []
-    for k in range(n_clusters):
-        mask = labels == k
-        if np.any(mask):
-            cluster_mean_depth.append((k, depth_list[mask].mean()))
-        else:
-            cluster_mean_depth.append((k, np.inf))
-    # 按深度排序
-    ordered = [k for k, _ in sorted(cluster_mean_depth, key=lambda x: x[1])]
+    计算一条曲线的过零点对应的 depth 坐标。
 
-    # 重新映射标签为 0..(n_clusters-1)，并按深度顺序编号
-    label_map = {old: new for new, old in enumerate(ordered)}
-    ordered_labels = np.array([label_map[l] for l in labels])
-
-    # 计算每个层的起止深度（扩展半个 bin 宽度以覆盖区间）
-    if len(depth_list) > 1:
-        bin_width = np.median(np.diff(np.sort(depth_list)))
-    else:
-        bin_width = 0.02
-    
-    layers = []
-    for layer_idx in range(n_clusters):
-        mask = ordered_labels == layer_idx
-        if not np.any(mask):
-            continue
-        start = depth_list[mask].min() - bin_width/2
-        end = depth_list[mask].max() + bin_width/2
-        start = max(0.0, start)
-        end = min(1.0, end)
-        mean_d = float(np.mean(avg_density[mask]))
-        layers.append({'layer': layer_idx+1, 'start': float(start), 'end': float(end), 'mean_density': mean_d})
-    
-    return layers, ordered_labels
-
-
-def _visualize_layers(layers, depth_list, avg_density, title_suffix='', issave=True, savename='depth_density_layers.png'):
-    """
-    可视化分层结果的辅助函数
-    """
-    cmap = plt.get_cmap('tab10')
-    plt.figure(figsize=(8, 5))
-    # 背景色带
-    ymax = max(avg_density) if np.any(avg_density) else 1.0
-    for i, L in enumerate(layers):
-        # 支持字符串类型的layer名称（如 "5/6"）
-        layer_idx = i if isinstance(L['layer'], str) else L['layer'] - 1
-        color = cmap(layer_idx % 10)
-        plt.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-        # 在区间中间标注层号
-        mid = (L['start'] + L['end']) / 2
-        plt.text(mid, ymax*0.95, f"L{L['layer']}", ha='center', va='top', fontsize=9, color=color)
-
-    plt.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-    plt.xlabel('Cell Depth (to GM)', fontsize=12)
-    plt.ylabel('Average Cell Density', fontsize=12)
-    plt.title(f'Segmented Layers (n={len(layers)}) {title_suffix}', fontsize=14)
-    plt.grid(True)
-    plt.tight_layout()
-    if issave: 
-        plt.savefig(os.path.join(output_dir, savename))
-    plt.show(block=True)
-
-    # # 竖向绘制密度-深度曲线和分层结果
-    # plt.figure(figsize=(5, 8))
-    # xmax = max(avg_density) if np.any(avg_density) else 1.0
-    
-    # for L in layers:
-    #     color = cmap((L['layer']-1) % 10)
-    #     plt.axhspan(L['start'], L['end'], color=color, alpha=0.18)
-    #     # 在区间中间标注层号
-    #     mid = (L['start'] + L['end']) / 2
-    #     plt.text(xmax*0.9, mid, f"Layer {L['layer']}", ha='right', va='center', fontsize=9, color=color)
-
-    # plt.plot(avg_density, depth_list, marker='o', linestyle='-', color='C1')
-    # plt.gca().invert_yaxis() # 翻转Y轴，使0(GM)在上方
-    
-    # plt.ylabel('Cell Depth (to GM)', fontsize=12)
-    # plt.xlabel('Average Cell Density', fontsize=12)
-    # plt.title(f'Segmented Layers (Vertical) {title_suffix}', fontsize=14)
-    # plt.grid(True)
-    # plt.tight_layout()
-    # plt.show()
-    
-    if issave:
-        vert_savename = savename.replace('.png', '_vertical.png')
-        if vert_savename == savename: 
-             vert_savename = 'vertical_' + savename
-
-def _compute_layer_density_diff(layers, method_name=''):
-    """
-    计算层间密度差异作为层间差异验证的辅助函数
-    
     参数:
-        layers: 分层结果列表，每个元素包含 'layer', 'start', 'end', 'mean_density'
-        method_name: 方法名称，用于打印
-    
+        values:
+            一维曲线值，例如二阶导数。
+        depth_sorted:
+            与 values 对齐的 depth 坐标。
+
     返回:
-        diff_stats: 包含层间差异统计信息的字典
+        numpy.ndarray
+            通过线性插值得到的过零 depth 列表。
+
+    在 peak-based 算法中的作用:
+        对二阶导数求过零点，用来近似“密度变化率最大的位置”，
+        这些位置会作为候选层边界。
     """
-    if len(layers) < 2:
-        print(f"\n[{method_name}] 层间密度差异验证: 层数不足，无法计算层间差异")
-        return None
-    
-    densities = [L['mean_density'] for L in layers]
-    
-    # 计算相邻层之间的密度差异
-    inter_layer_diffs = []
-    for i in range(len(densities) - 1):
-        diff = abs(densities[i+1] - densities[i])
-        inter_layer_diffs.append(diff)
-    
-    # 计算统计指标
-    mean_diff = np.mean(inter_layer_diffs)
-    max_diff = np.max(inter_layer_diffs)
-    min_diff = np.min(inter_layer_diffs)
-    std_diff = np.std(inter_layer_diffs)
-    total_range = max(densities) - min(densities)
-    
-    # 计算层间差异比率（相邻层差异占总密度范围的比例）
-    if total_range > 0:
-        diff_ratio = mean_diff / total_range
-    else:
-        diff_ratio = 0
-    
-    # 计算层间差异变异系数 (CV)
-    if mean_diff > 0:
-        cv = std_diff / mean_diff
-    else:
-        cv = 0
-    
-    # 打印层间差异信息
-    # print(f"\n[{method_name}] 层间密度差异验证:")
-    # print(f"  各层平均密度: {[f'{d:.2f}' for d in densities]}")
-    print(f"  相邻层间差异: {[f'{d:.2f}' for d in inter_layer_diffs]}")
-    print(f"  平均层间差异: {mean_diff:.4f}")
-    # print(f"  最大层间差异: {max_diff:.4f} (Layer {inter_layer_diffs.index(max_diff)+1} -> {inter_layer_diffs.index(max_diff)+2})")
-    # print(f"  最小层间差异: {min_diff:.4f}")
-    # print(f"  层间差异标准差: {std_diff:.4f}")
-    # print(f"  层间差异比率 (平均差异/总范围): {diff_ratio:.4f}")
-    print(f"  层间差异变异系数 (CV): {cv:.4f}")
-    
-    diff_stats = {
-        'densities': densities,
-        'inter_layer_diffs': inter_layer_diffs,
-        'mean_diff': mean_diff,
-        'max_diff': max_diff,
-        'min_diff': min_diff,
-        'std_diff': std_diff,
-        'total_range': total_range,
-        'diff_ratio': diff_ratio,
-        'cv': cv
-    }
-    
-    return diff_stats
+    crossings = []
+    for i in range(len(values) - 1):
+        if values[i] * values[i + 1] < 0:
+            t = abs(values[i]) / (abs(values[i]) + abs(values[i + 1]) + 1e-8)
+            crossings.append(i + t)
+    if not crossings:
+        return np.asarray([], dtype=float)
+    return np.interp(crossings, np.arange(len(depth_sorted)), depth_sorted)
 
 
-def segmentLayer_peak_based(avg_density, depth_list, sigma=2, merge_layer23=False, isshow=True, issave=True):
+def _mean_density_for_range(depth, density, start, end):
     """
-    基于峰值的分层算法
-    
-    算法逻辑：
-    1. 在深度0.1~0.8范围内搜索两个最明显的密度峰值
-    2. 左边峰值作为第2层中心，右边峰值作为第4层中心
-    3. 在峰值两侧搜索一阶梯度为0（二阶导数过零点，即密度变化率最大的拐点）作为层边界
-    4. 第5层和第6层合并为"5/6"层
-    5. 可选：第2层和第3层合并为"2/3"层（当merge_layer23=True时）
-    
+    计算指定 depth 区间内的平均密度。
+
     参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组  
-        sigma: 高斯平滑参数
-        merge_layer23: 是否合并第2层和第3层（忽略第一个峰值右侧的分层线）
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    
+        depth:
+            depth 坐标数组。
+        density:
+            density 数组，与 depth 对齐。
+        start:
+            区间起点。
+        end:
+            区间终点。
+
     返回:
-        layers: 分层结果列表，每层包含 layer, start, end, mean_density
-               - merge_layer23=False: 5层 (L1, L2, L3, L4, L5/6)
-               - merge_layer23=True:  4层 (L1, L2/3, L4, L5/6)
+        float
+            区间内 density 均值；如果区间内没有点，则返回 0。
     """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-    
-    # 按深度排序
-    sort_idx = np.argsort(depth_list)
-    depth_sorted = depth_list[sort_idx]
-    density_sorted = avg_density[sort_idx]
-    
-    # 高斯平滑
-    density_smooth = gaussian_filter1d(density_sorted, sigma=sigma)
-    
-    # 计算一阶和二阶导数
-    first_deriv = np.gradient(density_smooth, depth_sorted)
-    second_deriv = np.gradient(first_deriv, depth_sorted)
-    
-    # ===== 步骤1: 在0.1~0.8深度范围内找两个最明显的峰值 =====
-    search_mask = (depth_sorted >= 0.05) & (depth_sorted <= 0.8)
-    search_indices = np.where(search_mask)[0]
-    
-    if len(search_indices) < 5:
-        print("警告: 0.1~0.8深度范围内数据点不足，使用全范围搜索")
-        search_indices = np.arange(len(depth_sorted))
-    
-    # 在搜索范围内找峰值
-    density_search = density_smooth[search_indices]
-    # 使用相对高度和距离约束找峰值
-    min_distance = max(3, len(search_indices) // 10)
-    peaks_local, properties = find_peaks(
-        density_search, 
-        distance=min_distance,
-        prominence=np.ptp(density_search) * 0.1  # 峰值突出度至少为范围的10%
-    )
-    
-    # 映射回原始索引
-    peaks_global = search_indices[peaks_local]
-    
-    if len(peaks_global) < 2:
-        # 如果峰值不足2个，降低阈值重试
-        peaks_local, properties = find_peaks(density_search, distance=min_distance)
-        peaks_global = search_indices[peaks_local]
-    
-    if len(peaks_global) < 2:
-        print("警告: 未能找到足够的峰值，使用默认分层")
-        # 返回默认均匀5层分割
-        # return _create_default_5_layers(depth_sorted, density_sorted)
-        return _create_default_4_layers(depth_sorted, density_sorted)
-    
-    # 选择最高的两个峰值
-    peak_heights = density_smooth[peaks_global]
-    top2_idx = np.argsort(peak_heights)[-2:]
-    two_peaks = np.sort(peaks_global[top2_idx])  # 按深度排序
-    
-    peak_layer2_idx = two_peaks[0]  # 左峰 -> Layer 2中心
-    peak_layer4_idx = two_peaks[1]  # 右峰 -> Layer 4中心
-    
-    peak_layer2_depth = depth_sorted[peak_layer2_idx]
-    peak_layer4_depth = depth_sorted[peak_layer4_idx]
-    
-    print(f"  找到Layer 2中心: depth={peak_layer2_depth:.3f}, density={density_smooth[peak_layer2_idx]:.2f}")
-    print(f"  找到Layer 4中心: depth={peak_layer4_depth:.3f}, density={density_smooth[peak_layer4_idx]:.2f}")
-    
-    # ===== 步骤2: 寻找二阶导数过零点作为层边界 =====
-    # 二阶导数过零点 = 一阶导数的极值点 = 密度变化率最大的位置
-    
-    def find_zero_crossings(arr):
-        """找到数组中符号变化的位置（过零点）"""
-        crossings = []
-        for i in range(len(arr) - 1):
-            if arr[i] * arr[i+1] < 0:
-                # 线性插值找更精确的位置
-                crossings.append(i + abs(arr[i]) / (abs(arr[i]) + abs(arr[i+1]) + 1e-8))
-        return crossings
-    
-    zero_crossings = find_zero_crossings(second_deriv)
-    zero_crossing_depths = np.interp(zero_crossings, np.arange(len(depth_sorted)), depth_sorted)
-    
-    print(f"  二阶导数过零点数量: {len(zero_crossings)}")
-    
-    # ===== 步骤3: 根据峰值位置确定层边界 =====
-    # Layer 1: 0 ~ boundary_1_2
-    # Layer 2: boundary_1_2 ~ boundary_2_3 (中心在peak_layer2)
-    # Layer 3: boundary_2_3 ~ boundary_3_4
-    # Layer 4: boundary_3_4 ~ boundary_4_56 (中心在peak_layer4)
-    # Layer 5/6: boundary_4_56 ~ 1.0
-    
-    boundaries = [0.0]  # 起始边界
-    
-    # 边界1-2: Layer2峰值左侧最近的过零点
-    left_of_peak2 = [d for d in zero_crossing_depths if d < peak_layer2_depth]
-    if left_of_peak2:
-        boundary_1_2 = max(left_of_peak2)  # 最靠近峰值的
-    else:
-        boundary_1_2 = peak_layer2_depth * 0.5  # 默认
-    boundaries.append(boundary_1_2)
-    
-    # 边界2-3: Layer2峰值和Layer4峰值之间的过零点
-    between_peaks = [d for d in zero_crossing_depths 
-                    if peak_layer2_depth < d < peak_layer4_depth]
-    if between_peaks:
-        # 取中间的过零点，或者最接近两峰中点的
-        mid_point = (peak_layer2_depth + peak_layer4_depth) / 2
-        boundary_2_3 = min(between_peaks, key=lambda x: abs(x - mid_point * 0.7))  # 偏向Layer2
-        
-        # 如果有多个过零点，找Layer3的边界
-        remaining = [d for d in between_peaks if d > boundary_2_3]
-        if remaining:
-            boundary_3_4 = min(remaining, key=lambda x: abs(x - mid_point * 1.3))  # 偏向Layer4
-        else:
-            boundary_3_4 = (boundary_2_3 + peak_layer4_depth) / 2
-    else:
-        # 没有过零点，均分
-        boundary_2_3 = peak_layer2_depth + (peak_layer4_depth - peak_layer2_depth) * 0.33
-        boundary_3_4 = peak_layer2_depth + (peak_layer4_depth - peak_layer2_depth) * 0.67
-    
-    boundaries.append(boundary_2_3)
-    boundaries.append(boundary_3_4)
-    
-    # 边界4-5/6: Layer4峰值右侧的过零点
-    right_of_peak4 = [d for d in zero_crossing_depths if d > peak_layer4_depth]
-    if right_of_peak4:
-        boundary_4_56 = min(right_of_peak4)  # 最靠近峰值的
-    else:
-        boundary_4_56 = peak_layer4_depth + (1.0 - peak_layer4_depth) * 0.4
-    boundaries.append(boundary_4_56)
-    
-    boundaries.append(1.0)  # 结束边界
-    
-    # 确保边界递增
-    for i in range(1, len(boundaries)):
-        if boundaries[i] <= boundaries[i-1]:
-            boundaries[i] = boundaries[i-1] + 0.02
-    boundaries = np.clip(boundaries, 0, 1)
-    
-    print(f"  计算出的层边界(原始): {[f'{b:.3f}' for b in boundaries]}")
-    
-    # ===== 步骤4: 根据merge_layer23参数构建分层结果 =====
+    in_range = (depth >= start) & (depth <= end)
+    return float(np.mean(density[in_range])) if np.any(in_range) else 0.0
+
+
+def _default_layers(depth, density, merge_layer23):
+    """
+    当无法可靠检测到两个密度峰时，返回保底分层边界。
+
+    参数:
+        depth:
+            分箱后的 depth 坐标。
+        density:
+            分箱后的 density 曲线。
+        merge_layer23:
+            True 时输出 4 层：L1、L2/3、L4、L5/6；
+            False 时输出 5 层：L1、L2、L3、L4、L5/6。
+
+    返回:
+        list[dict]
+            每个 dict 包含 layer、start、end、mean_density。
+    """
     if merge_layer23:
-        # 合并第2层和第3层：忽略boundary_2_3（第一个峰值右侧的分层线）
-        # 原始边界: [0, boundary_1_2, boundary_2_3, boundary_3_4, boundary_4_56, 1.0]
-        # 合并后:   [0, boundary_1_2, boundary_3_4, boundary_4_56, 1.0]
-        merged_boundaries = [boundaries[0], boundaries[1], boundaries[3], boundaries[4], boundaries[5]]
-        layer_names = ['1', '2/3', '4', '5/6']
-        n_layers = 4
-        print(f"  合并L2/L3后的边界: {[f'{b:.3f}' for b in merged_boundaries]}")
+        boundaries = [0.0, 0.07, 0.35, 0.5, 1.0]
+        names = ["1", "2/3", "4", "5/6"]
     else:
-        # 保持5层
-        merged_boundaries = boundaries
-        layer_names = ['1', '2', '3', '4', '5/6']
-        n_layers = 5
-    
-    layers = []
-    for i in range(n_layers):
-        start = merged_boundaries[i]
-        end = merged_boundaries[i + 1]
-        
-        # 计算该层的平均密度
-        mask = (depth_sorted >= start) & (depth_sorted <= end)
-        if np.any(mask):
-            mean_density = float(np.mean(density_sorted[mask]))
-        else:
-            mean_density = 0.0
-        
-        layers.append({
-            'layer': layer_names[i],
-            'start': float(start),
-            'end': float(end),
-            'mean_density': mean_density
-        })
-    
-    # ===== 可视化 =====
-    print(f"  [调试] isshow={isshow}, issave={issave}, merge_layer23={merge_layer23}")
-    if isshow:
-        print("  [调试] 正在调用 _visualize_peak_based_layers...")
-        _visualize_peak_based_layers(
-            layers, depth_sorted, density_sorted, density_smooth,
-            first_deriv, second_deriv,
-            peak_layer2_idx, peak_layer4_idx, zero_crossing_depths,
-            issave, merge_layer23
-        )
-        print("  [调试] _visualize_peak_based_layers 调用完成")
-    
-    # 计算层间密度差异
-    method_name = 'Peak-Based (L2/3 merged)' if merge_layer23 else 'Peak-Based'
-    _compute_layer_density_diff(layers, method_name)
-    
-    return layers
+        boundaries = [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
+        names = ["1", "2", "3", "4", "5/6"]
 
-
-def _create_default_5_layers(depth_sorted, density_sorted):
-    """创建默认的5层分割"""
-    boundaries = [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
-    layer_names = ['1', '2', '3', '4', '5/6']
-    layers = []
-    
-    for i in range(5):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        mask = (depth_sorted >= start) & (depth_sorted <= end)
-        mean_density = float(np.mean(density_sorted[mask])) if np.any(mask) else 0.0
-        layers.append({
-            'layer': layer_names[i],
-            'start': float(start),
-            'end': float(end),
-            'mean_density': mean_density
-        })
-    return layers
-
-def _create_default_4_layers(depth_sorted, density_sorted):
-    """创建默认的4层分割"""
-    boundaries = [0.0, 0.1, 0.3, 0.5, 1.0]
-    layer_names = ['1', '2/3', '4', '5/6']
-    layers = []
-    
-    for i in range(4):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        mask = (depth_sorted >= start) & (depth_sorted <= end)
-        mean_density = float(np.mean(density_sorted[mask])) if np.any(mask) else 0.0
-        layers.append({
-            'layer': layer_names[i],
-            'start': float(start),
-            'end': float(end),
-            'mean_density': mean_density
-        })
-    return layers
-
-
-def _visualize_peak_based_layers(layers, depth_sorted, density_sorted, density_smooth,
-                                  first_deriv, second_deriv,
-                                  peak2_idx, peak4_idx, zero_crossings,
-                                  issave=True, merge_layer23=False):
-    """可视化基于峰值的分层结果"""
-    
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
-    
-    # 上图：密度曲线、峰值和分层
-    ax1 = axes[0]
-    cmap = plt.get_cmap('tab10')
-    ymax = max(density_sorted) if np.any(density_sorted) else 1.0
-    
-    # 绘制分层背景色带
-    for i, L in enumerate(layers):
-        color = cmap(i % 10)
-        ax1.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-        mid = (L['start'] + L['end']) / 2
-        ax1.text(mid, ymax*0.95, f"L{L['layer']}", ha='center', va='top', fontsize=10, color=color, fontweight='bold')
-    
-    # 绘制密度曲线
-    ax1.plot(depth_sorted, density_sorted, 'o-', color='C1', alpha=0.5, label='Raw Density', markersize=4)
-    ax1.plot(depth_sorted, density_smooth, '-', color='C0', linewidth=2, label='Smoothed Density')
-    
-    # 标记峰值
-    peak_label2 = 'L2/3 Peak' if merge_layer23 else 'L2 Peak'
-    ax1.axvline(depth_sorted[peak2_idx], color='red', linestyle='--', alpha=0.8, label=f'{peak_label2} ({depth_sorted[peak2_idx]:.2f})')
-    ax1.axvline(depth_sorted[peak4_idx], color='purple', linestyle='--', alpha=0.8, label=f'L4 Peak ({depth_sorted[peak4_idx]:.2f})')
-    ax1.scatter([depth_sorted[peak2_idx], depth_sorted[peak4_idx]], 
-                [density_smooth[peak2_idx], density_smooth[peak4_idx]], 
-                color='red', s=100, zorder=5, marker='*')
-    
-    ax1.set_xlabel('Depth (GM → WM)', fontsize=11)
-    ax1.set_ylabel('Cell Density', fontsize=11)
-    # 根据是否合并调整标题
-    if merge_layer23:
-        title = 'Peak-Based Layer Segmentation (4 Layers: L1, L2/3, L4, L5/6)'
-    else:
-        title = 'Peak-Based Layer Segmentation (5 Layers: L1, L2, L3, L4, L5/6)'
-    ax1.set_title(title, fontsize=12)
-    ax1.legend(loc='upper right', fontsize=9)
-    ax1.grid(True, alpha=0.3)
-    
-    # 中图：一阶导数
-    ax2 = axes[1]
-    ax2.plot(depth_sorted, first_deriv, '-', color='green', linewidth=1.5)
-    ax2.axhline(0, color='gray', linestyle='-', alpha=0.5)
-    ax2.axvline(depth_sorted[peak2_idx], color='red', linestyle='--', alpha=0.5)
-    ax2.axvline(depth_sorted[peak4_idx], color='purple', linestyle='--', alpha=0.5)
-    ax2.set_xlabel('Depth', fontsize=11)
-    ax2.set_ylabel('1st Derivative (Gradient)', fontsize=11)
-    ax2.set_title('First Derivative of Density', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    
-    # 下图：二阶导数和过零点
-    ax3 = axes[2]
-    ax3.plot(depth_sorted, second_deriv, '-', color='orange', linewidth=1.5)
-    ax3.axhline(0, color='gray', linestyle='-', alpha=0.5)
-    
-    # 标记过零点
-    for zc in zero_crossings:
-        ax3.axvline(zc, color='blue', linestyle=':', alpha=0.6)
-    
-    ax3.axvline(depth_sorted[peak2_idx], color='red', linestyle='--', alpha=0.5)
-    ax3.axvline(depth_sorted[peak4_idx], color='purple', linestyle='--', alpha=0.5)
-    ax3.set_xlabel('Depth', fontsize=11)
-    ax3.set_ylabel('2nd Derivative', fontsize=11)
-    ax3.set_title('Second Derivative (Zero-crossings = Layer Boundaries)', fontsize=12)
-    ax3.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    if issave:
-        try:
-            save_path = os.path.join(output_dir, 'depth_density_layers_peak_based.png')
-            os.makedirs(output_dir, exist_ok=True)
-            plt.savefig(save_path, dpi=150)
-            print(f"  分层结果图已保存: {save_path}")
-        except Exception as e:
-            print(f"  保存分层结果图失败: {e}")
-    plt.show(block=True)
-    print("  [调试] plt.show() 已执行")
-
-
-def segmentLayer_kmeans(avg_density, depth_list, n_clusters=6, offset=False, isshow=True, issave=True):
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-
-    # 特征：[归一化深度, 归一化平均密度]；做min-max归一化以平衡尺度
-    d_min, d_ptp = depth_list.min(), np.ptp(depth_list) + 1e-8
-    rho_min, rho_ptp = avg_density.min(), np.ptp(avg_density) + 1e-8
-    depth_scaled = (depth_list - d_min) / d_ptp
-    dens_scaled = (avg_density - rho_min) / rho_ptp
-    X_norm = np.vstack([depth_scaled, dens_scaled]).T
-
-    if offset:
-        # 定义目标深度初始点
-        target_depths = np.array([0.05, 0.18, 0.35, 0.55, 0.75, 0.92])
-        # (插值)获取这些深度对应的密度值
-        sort_idx = np.argsort(depth_list)
-        target_densities = np.interp(target_depths, depth_list[sort_idx], avg_density[sort_idx])
-
-        # 将初始点归一化到与 X_norm 相同的空间
-        init_d_norm = (target_depths - d_min) / d_ptp
-        init_rho_norm = (target_densities - rho_min) / rho_ptp
-        init_centers = np.vstack([init_d_norm, init_rho_norm]).T
-
-        kmeans = KMeans(n_clusters=n_clusters, init=init_centers, n_init=1, random_state=42)
-    else:
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    
-    labels = kmeans.fit_predict(X_norm)
-    layers, _ = _labels_to_layers(labels, depth_list, avg_density, n_clusters)
-
-    if isshow:
-        _visualize_layers(layers, depth_list, avg_density, '[KMeans]', issave, 'depth_density_layers_kmeans.png')
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'KMeans')
-
-    return layers
-
-
-def segmentLayer_gradient(avg_density, depth_list, n_layers=6, sigma=2, isshow=True, issave=True):
-    """
-    方法1: 密度梯度分析法
-    通过计算密度曲线的一阶导数（梯度），在梯度变化剧烈处（极值点）确定层边界
-    
-    参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组
-        n_layers: 目标分层数量
-        sigma: 高斯平滑参数
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-    
-    # 按深度排序
-    sort_idx = np.argsort(depth_list)
-    depth_sorted = depth_list[sort_idx]
-    density_sorted = avg_density[sort_idx]
-    
-    # 高斯平滑以减少噪声
-    density_smooth = gaussian_filter1d(density_sorted, sigma=sigma)
-    
-    # 计算一阶导数（梯度）
-    gradient = np.gradient(density_smooth, depth_sorted)
-    
-    # 找到梯度的极值点（正负转换处）作为潜在边界
-    # 使用梯度绝对值的峰值
-    gradient_abs = np.abs(gradient)
-    peaks, properties = find_peaks(gradient_abs, height=np.percentile(gradient_abs, 50))
-    
-    # 如果找到的边界点太少，降低阈值
-    if len(peaks) < n_layers - 1:
-        peaks, properties = find_peaks(gradient_abs, height=np.percentile(gradient_abs, 25))
-    
-    # 选择最显著的 n_layers-1 个边界点
-    if len(peaks) >= n_layers - 1:
-        # 按峰值高度排序，选择最高的
-        peak_heights = properties['peak_heights']
-        top_indices = np.argsort(peak_heights)[::-1][:n_layers-1]
-        boundary_indices = np.sort(peaks[top_indices])
-    else:
-        # 如果边界点不够，均匀分割
-        boundary_indices = np.linspace(0, len(depth_sorted)-1, n_layers+1, dtype=int)[1:-1]
-    
-    # 构建边界深度
-    boundaries = [0.0] + list(depth_sorted[boundary_indices]) + [1.0]
-    boundaries = sorted(set(boundaries))
-    
-    # 构建layers
-    layers = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        mask = (depth_sorted >= start) & (depth_sorted < end)
-        if i == len(boundaries) - 2:  # 最后一层包含右边界
-            mask = (depth_sorted >= start) & (depth_sorted <= end)
-        if np.any(mask):
-            mean_d = float(np.mean(density_sorted[mask]))
-        else:
-            mean_d = 0.0
-        layers.append({'layer': i+1, 'start': float(start), 'end': float(end), 'mean_density': mean_d})
-
-    if isshow:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # 上图：密度曲线和梯度
-        ax1 = axes[0]
-        ax1.plot(depth_sorted, density_smooth, 'b-', label='Smoothed Density', linewidth=2)
-        ax1.set_xlabel('Depth')
-        ax1.set_ylabel('Density', color='b')
-        ax1.tick_params(axis='y', labelcolor='b')
-        
-        ax1_twin = ax1.twinx()
-        ax1_twin.plot(depth_sorted, gradient, 'r--', label='Gradient', alpha=0.7)
-        ax1_twin.set_ylabel('Gradient', color='r')
-        ax1_twin.tick_params(axis='y', labelcolor='r')
-        
-        # 标记边界点
-        for idx in boundary_indices:
-            ax1.axvline(depth_sorted[idx], color='green', linestyle=':', alpha=0.8)
-        ax1.set_title('Density Gradient Analysis')
-        ax1.legend(loc='upper left')
-        
-        # 下图：分层结果
-        ax2 = axes[1]
-        cmap = plt.get_cmap('tab10')
-        ymax = max(avg_density) if np.any(avg_density) else 1.0
-        for L in layers:
-            color = cmap((L['layer']-1) % 10)
-            ax2.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-            mid = (L['start'] + L['end']) / 2
-            ax2.text(mid, ymax*0.95, f"Layer {L['layer']}", ha='center', va='top', fontsize=9, color=color)
-        ax2.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-        ax2.set_xlabel('Cell Depth (to GM)')
-        ax2.set_ylabel('Average Cell Density')
-        ax2.set_title(f'Segmented Layers (n={len(layers)}) [Gradient Method]')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        if issave:
-            plt.savefig('depth_density_layers_gradient.png')
-        plt.show()
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'Gradient')
-
-    return layers
-
-
-def segmentLayer_second_derivative(avg_density, depth_list, n_layers=6, sigma=3, isshow=True, issave=True):
-    """
-    方法2: 二阶导数方法
-    通过计算密度曲线的二阶导数，在拐点处（二阶导数过零点）确定层边界
-    
-    参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组
-        n_layers: 目标分层数量
-        sigma: 高斯平滑参数
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-    
-    # 按深度排序
-    sort_idx = np.argsort(depth_list)
-    depth_sorted = depth_list[sort_idx]
-    density_sorted = avg_density[sort_idx]
-    
-    # 高斯平滑
-    density_smooth = gaussian_filter1d(density_sorted, sigma=sigma)
-    
-    # 计算一阶和二阶导数
-    first_deriv = np.gradient(density_smooth, depth_sorted)
-    second_deriv = np.gradient(first_deriv, depth_sorted)
-    
-    # 找到二阶导数的过零点（拐点）
-    zero_crossings = []
-    for i in range(len(second_deriv) - 1):
-        if second_deriv[i] * second_deriv[i+1] < 0:  # 符号变化
-            # 线性插值找到精确的过零位置
-            zero_crossings.append(i)
-    
-    # 同时找到二阶导数的极值点
-    local_max = argrelextrema(second_deriv, np.greater, order=2)[0]
-    local_min = argrelextrema(second_deriv, np.less, order=2)[0]
-    extrema = np.sort(np.concatenate([local_max, local_min]))
-    
-    # 合并过零点和极值点作为候选边界
-    candidates = np.unique(np.concatenate([zero_crossings, extrema]))
-    
-    # 选择最显著的边界点
-    if len(candidates) >= n_layers - 1:
-        # 按二阶导数绝对值排序
-        significance = np.abs(second_deriv[candidates])
-        top_indices = np.argsort(significance)[::-1][:n_layers-1]
-        boundary_indices = np.sort(candidates[top_indices])
-    else:
-        # 如果边界点不够，均匀分割
-        boundary_indices = np.linspace(0, len(depth_sorted)-1, n_layers+1, dtype=int)[1:-1]
-    
-    # 构建边界深度
-    boundaries = [0.0] + list(depth_sorted[boundary_indices]) + [1.0]
-    boundaries = sorted(set(boundaries))
-    
-    # 构建layers
-    layers = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        mask = (depth_sorted >= start) & (depth_sorted < end)
-        if i == len(boundaries) - 2:
-            mask = (depth_sorted >= start) & (depth_sorted <= end)
-        if np.any(mask):
-            mean_d = float(np.mean(density_sorted[mask]))
-        else:
-            mean_d = 0.0
-        layers.append({'layer': i+1, 'start': float(start), 'end': float(end), 'mean_density': mean_d})
-
-    if isshow:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # 上图：密度曲线和二阶导数
-        ax1 = axes[0]
-        ax1.plot(depth_sorted, density_smooth, 'b-', label='Smoothed Density', linewidth=2)
-        ax1.set_xlabel('Depth')
-        ax1.set_ylabel('Density', color='b')
-        ax1.tick_params(axis='y', labelcolor='b')
-        
-        ax1_twin = ax1.twinx()
-        ax1_twin.plot(depth_sorted, second_deriv, 'r--', label='2nd Derivative', alpha=0.7)
-        ax1_twin.axhline(0, color='gray', linestyle='-', alpha=0.5)
-        ax1_twin.set_ylabel('2nd Derivative', color='r')
-        ax1_twin.tick_params(axis='y', labelcolor='r')
-        
-        # 标记边界点
-        for idx in boundary_indices:
-            ax1.axvline(depth_sorted[idx], color='green', linestyle=':', alpha=0.8)
-        ax1.set_title('Second Derivative Analysis (Inflection Points)')
-        ax1.legend(loc='upper left')
-        
-        # 下图：分层结果
-        ax2 = axes[1]
-        cmap = plt.get_cmap('tab10')
-        ymax = max(avg_density) if np.any(avg_density) else 1.0
-        for L in layers:
-            color = cmap((L['layer']-1) % 10)
-            ax2.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-            mid = (L['start'] + L['end']) / 2
-            ax2.text(mid, ymax*0.95, f"Layer {L['layer']}", ha='center', va='top', fontsize=9, color=color)
-        ax2.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-        ax2.set_xlabel('Cell Depth (to GM)')
-        ax2.set_ylabel('Average Cell Density')
-        ax2.set_title(f'Segmented Layers (n={len(layers)}) [2nd Derivative Method]')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        if issave:
-            plt.savefig('depth_density_layers_2nd_derivative.png')
-        plt.show()
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, '2nd Derivative')
-
-    return layers
-
-
-def segmentLayer_gmm(avg_density, depth_list, n_clusters=6, isshow=True, issave=True):
-    """
-    方法4: 高斯混合模型 (GMM)
-    使用GMM对深度-密度二维数据进行概率聚类
-    
-    参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组
-        n_clusters: 聚类数量
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-
-    # 特征归一化
-    d_min, d_ptp = depth_list.min(), np.ptp(depth_list) + 1e-8
-    rho_min, rho_ptp = avg_density.min(), np.ptp(avg_density) + 1e-8
-    depth_scaled = (depth_list - d_min) / d_ptp
-    dens_scaled = (avg_density - rho_min) / rho_ptp
-    X_norm = np.vstack([depth_scaled, dens_scaled]).T
-
-    # 使用GMM进行聚类
-    gmm = GaussianMixture(n_components=n_clusters, covariance_type='full', 
-                          random_state=42, n_init=10)
-    labels = gmm.fit_predict(X_norm)
-    
-    # 获取每个点属于各簇的概率
-    probas = gmm.predict_proba(X_norm)
-    
-    layers, ordered_labels = _labels_to_layers(labels, depth_list, avg_density, n_clusters)
-
-    if isshow:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # 左图：概率分布热图
-        ax1 = axes[0]
-        sort_idx = np.argsort(depth_list)
-        im = ax1.imshow(probas[sort_idx].T, aspect='auto', cmap='YlOrRd',
-                        extent=[depth_list.min(), depth_list.max(), n_clusters-0.5, -0.5])
-        ax1.set_xlabel('Depth')
-        ax1.set_ylabel('Cluster')
-        ax1.set_title('GMM Cluster Probabilities')
-        plt.colorbar(im, ax=ax1, label='Probability')
-        
-        # 右图：分层结果
-        ax2 = axes[1]
-        cmap = plt.get_cmap('tab10')
-        ymax = max(avg_density) if np.any(avg_density) else 1.0
-        for L in layers:
-            color = cmap((L['layer']-1) % 10)
-            ax2.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-            mid = (L['start'] + L['end']) / 2
-            ax2.text(mid, ymax*0.95, f"Layer {L['layer']}", ha='center', va='top', fontsize=9, color=color)
-        ax2.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-        ax2.set_xlabel('Cell Depth (to GM)')
-        ax2.set_ylabel('Average Cell Density')
-        ax2.set_title(f'Segmented Layers (n={len(layers)}) [GMM]')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        if issave:
-            plt.savefig('depth_density_layers_gmm.png')
-        plt.show()
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'GMM')
-
-    return layers
-
-
-def segmentLayer_multi_threshold(avg_density, depth_list, n_layers=6, isshow=True, issave=True):
-    """
-    方法5: 多阈值分割法
-    基于密度值的多阈值分割，使用Otsu多阈值或均匀分位数方法
-    
-    参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组
-        n_layers: 目标分层数量
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-    
-    # 按深度排序
-    sort_idx = np.argsort(depth_list)
-    depth_sorted = depth_list[sort_idx]
-    density_sorted = avg_density[sort_idx]
-    
-    # 方法：基于密度变化率的自适应阈值
-    # 计算密度的变化
-    density_diff = np.abs(np.diff(density_sorted))
-    density_diff = np.concatenate([[0], density_diff])  # 补齐长度
-    
-    # 计算累积密度变化作为分割依据
-    cumsum_diff = np.cumsum(density_diff)
-    total_diff = cumsum_diff[-1] + 1e-8
-    normalized_cumsum = cumsum_diff / total_diff
-    
-    # 根据累积变化量均匀分割
-    thresholds = np.linspace(0, 1, n_layers + 1)[1:-1]
-    boundary_indices = []
-    for thresh in thresholds:
-        idx = np.argmin(np.abs(normalized_cumsum - thresh))
-        boundary_indices.append(idx)
-    boundary_indices = np.unique(boundary_indices)
-    
-    # 如果边界点不够，补充基于密度分位数的边界
-    if len(boundary_indices) < n_layers - 1:
-        # 使用密度分位数作为补充
-        density_percentiles = np.percentile(density_sorted, np.linspace(0, 100, n_layers + 1)[1:-1])
-        for perc in density_percentiles:
-            idx = np.argmin(np.abs(density_sorted - perc))
-            boundary_indices = np.append(boundary_indices, idx)
-        boundary_indices = np.unique(boundary_indices)[:n_layers-1]
-    
-    boundary_indices = np.sort(boundary_indices)
-    
-    # 构建边界深度
-    boundaries = [0.0] + list(depth_sorted[boundary_indices]) + [1.0]
-    boundaries = sorted(set(boundaries))
-    
-    # 构建layers
-    layers = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        mask = (depth_sorted >= start) & (depth_sorted < end)
-        if i == len(boundaries) - 2:
-            mask = (depth_sorted >= start) & (depth_sorted <= end)
-        if np.any(mask):
-            mean_d = float(np.mean(density_sorted[mask]))
-        else:
-            mean_d = 0.0
-        layers.append({'layer': i+1, 'start': float(start), 'end': float(end), 'mean_density': mean_d})
-
-    if isshow:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-        
-        # 上图：密度曲线和累积变化
-        ax1 = axes[0]
-        ax1.plot(depth_sorted, density_sorted, 'b-', label='Density', linewidth=2)
-        ax1.set_xlabel('Depth')
-        ax1.set_ylabel('Density', color='b')
-        ax1.tick_params(axis='y', labelcolor='b')
-        
-        ax1_twin = ax1.twinx()
-        ax1_twin.plot(depth_sorted, normalized_cumsum, 'g--', label='Cumulative Change', alpha=0.7)
-        ax1_twin.set_ylabel('Normalized Cumulative Change', color='g')
-        ax1_twin.tick_params(axis='y', labelcolor='g')
-        
-        # 标记阈值线
-        for thresh in thresholds:
-            ax1_twin.axhline(thresh, color='red', linestyle=':', alpha=0.5)
-        
-        # 标记边界点
-        for idx in boundary_indices:
-            ax1.axvline(depth_sorted[idx], color='purple', linestyle=':', alpha=0.8)
-        ax1.set_title('Multi-Threshold Segmentation (Density Change Based)')
-        ax1.legend(loc='upper left')
-        
-        # 下图：分层结果
-        ax2 = axes[1]
-        cmap = plt.get_cmap('tab10')
-        ymax = max(avg_density) if np.any(avg_density) else 1.0
-        for L in layers:
-            color = cmap((L['layer']-1) % 10)
-            ax2.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-            mid = (L['start'] + L['end']) / 2
-            ax2.text(mid, ymax*0.95, f"Layer {L['layer']}", ha='center', va='top', fontsize=9, color=color)
-        ax2.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-        ax2.set_xlabel('Cell Depth (to GM)')
-        ax2.set_ylabel('Average Cell Density')
-        ax2.set_title(f'Segmented Layers (n={len(layers)}) [Multi-Threshold]')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        if issave:
-            plt.savefig('depth_density_layers_multi_threshold.png')
-        plt.show()
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'Multi-Threshold')
-
-    return layers
-
-
-def segmentLayer_dbscan(avg_density, depth_list, eps=0.15, min_samples=2, isshow=True, issave=True):
-    """
-    方法6: DBSCAN密度聚类
-    使用DBSCAN对深度-密度二维数据进行基于密度的聚类，能够自动发现任意形状的簇
-    
-    参数:
-        avg_density: 平均密度数组
-        depth_list: 深度数组
-        eps: DBSCAN的邻域半径参数，控制簇的紧密程度
-        min_samples: 形成核心点所需的最小样本数
-        isshow: 是否显示可视化
-        issave: 是否保存图像
-    """
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-
-    # 特征归一化
-    d_min, d_ptp = depth_list.min(), np.ptp(depth_list) + 1e-8
-    rho_min, rho_ptp = avg_density.min(), np.ptp(avg_density) + 1e-8
-    depth_scaled = (depth_list - d_min) / d_ptp
-    dens_scaled = (avg_density - rho_min) / rho_ptp
-    X_norm = np.vstack([depth_scaled, dens_scaled]).T
-
-    # 使用DBSCAN进行聚类
-    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    labels = dbscan.fit_predict(X_norm)
-    
-    # 处理噪声点（标签为-1的点）
-    # 将噪声点分配给最近的非噪声点
-    unique_labels = set(labels)
-    if -1 in unique_labels:
-        noise_mask = labels == -1
-        non_noise_mask = ~noise_mask
-        
-        if np.any(non_noise_mask):
-            # 对于每个噪声点，找到最近的非噪声点并分配相同的标签
-            from scipy.spatial.distance import cdist
-            noise_points = X_norm[noise_mask]
-            non_noise_points = X_norm[non_noise_mask]
-            non_noise_labels = labels[non_noise_mask]
-            
-            distances = cdist(noise_points, non_noise_points)
-            nearest_indices = np.argmin(distances, axis=1)
-            labels[noise_mask] = non_noise_labels[nearest_indices]
-    
-    # 获取实际的簇数量
-    unique_labels = set(labels)
-    n_clusters = len(unique_labels)
-    
-    if n_clusters == 0:
-        print("警告: DBSCAN未找到任何簇，尝试调整eps和min_samples参数")
-        return []
-    
-    # 使用辅助函数转换标签为层
-    layers, ordered_labels = _labels_to_layers(labels, depth_list, avg_density, n_clusters)
-
-    if isshow:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # 左图：聚类散点图
-        ax1 = axes[0]
-        cmap = plt.get_cmap('tab10')
-        for label in np.unique(ordered_labels):
-            mask = ordered_labels == label
-            color = cmap(label % 10)
-            ax1.scatter(depth_list[mask], avg_density[mask], c=[color], 
-                       label=f'Cluster {label+1}', s=50, alpha=0.7)
-        ax1.set_xlabel('Depth')
-        ax1.set_ylabel('Average Density')
-        ax1.set_title(f'DBSCAN Clustering (eps={eps}, min_samples={min_samples})')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # 右图：分层结果
-        ax2 = axes[1]
-        ymax = max(avg_density) if np.any(avg_density) else 1.0
-        for L in layers:
-            color = cmap((L['layer']-1) % 10)
-            ax2.axvspan(L['start'], L['end'], color=color, alpha=0.18)
-            mid = (L['start'] + L['end']) / 2
-            ax2.text(mid, ymax*0.95, f"Layer {L['layer']}", ha='center', va='top', fontsize=9, color=color)
-        ax2.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-        ax2.set_xlabel('Cell Depth (to GM)')
-        ax2.set_ylabel('Average Cell Density')
-        ax2.set_title(f'Segmented Layers (n={len(layers)}) [DBSCAN]')
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        if issave:
-            plt.savefig('depth_density_layers_dbscan.png')
-        plt.show()
-
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'DBSCAN')
-
-    return layers
-
-
-def customSegmentPipeline(avg_density, depth_list, isshow=True, issave=True):
-    # 分步分层
-    # 初始化Layers列表
-    depth_list = np.asarray(depth_list)
-    avg_density = np.asarray(avg_density)
-    layers = []
-    
-    L1_scale = depth_list <= 0.2
-    depth_l1 = depth_list[L1_scale]
-    density_l1 = avg_density[L1_scale]
-    # 寻找density_l1的波谷位置作为L1/L2边界
-    if len(density_l1) >= 3:
-        valleys, _ = find_peaks(-density_l1, distance=5)
-        if len(valleys) > 0:
-            L1_edge = depth_l1[valleys[0]]
-        else:
-            L1_edge = 0.1
-
-    # 计算0-0.1深度范围内的平均密度
-    mask_l1 = depth_list < L1_edge
-    mean_density_l1 = np.mean(avg_density[mask_l1]) if np.any(mask_l1) else 0
-    L1 = {'layer': 1, 'start': 0.0, 'end': L1_edge, 'mean_density': mean_density_l1}
-    layers.append(L1)
-
-    # L2-L6: GMM 3聚类
-    mask_rest = depth_list >= L1_edge
-    depth_rest = depth_list[mask_rest]
-    density_rest = avg_density[mask_rest]
-    
-    # 特征归一化
-    d_min, d_ptp = depth_rest.min(), np.ptp(depth_rest) + 1e-8
-    rho_min, rho_ptp = density_rest.min(), np.ptp(density_rest) + 1e-8
-    depth_scaled = (depth_rest - d_min) / d_ptp
-    dens_scaled = (density_rest - rho_min) / rho_ptp
-    X_norm = np.vstack([depth_scaled, dens_scaled]).T
-
-    # 在density_rest中寻找2个波峰位置作为L2/3和L4的初始中心
-    peaks, _ = find_peaks(avg_density[(L1_edge <= depth_list) & (depth_list <= 0.8)], distance=5)
-    if len(peaks) >= 3:
-        left_peak = peaks[0]
-        right_peak = peaks[-1]
-        peak_scale = right_peak - left_peak
-        left_scale = [x for x in peaks if x - left_peak < peak_scale / 2]
-        right_scale = [x for x in peaks if right_peak - x < peak_scale / 2]
-        # 找到left_scale中的最高峰作为L2/3中点
-        L23_mid = depth_rest[left_scale][np.argmax(density_rest[left_scale])]
-        # 找到right_scale中的最高峰作为L4中点
-        L4_mid = depth_rest[right_scale][np.argmax(density_rest[right_scale])]
-        L56_mid = 1 - (1 - L4_mid) / 2
-    elif len(peaks) == 2:
-        # 左边的波峰作为L2/3中点，右边的波峰作为L4中点
-        peak_depths = depth_rest[peaks]
-        L23_mid = peak_depths.min()
-        L4_mid = peak_depths.max()
-        L56_mid = 1 - (1 - L4_mid) / 2
-    else:
-        L23_mid = 0.18
-        L4_mid = 0.5
-        L56_mid = 1 - (1 - L4_mid) / 2
-
-    # 使用GMM进行3分类
-    n_clusters = 3
-    # # 定义初始聚类中心：[归一化深度, 归一化密度]
-    # 通过插值获取对应深度的密度值作为初始中心
-    target_depths_norm = np.array([L23_mid, L4_mid, L56_mid])
-    sort_idx_rest = np.argsort(depth_scaled)
-    target_dens_norm = np.interp(target_depths_norm, depth_scaled[sort_idx_rest], dens_scaled[sort_idx_rest])
-    init_means = np.column_stack([target_depths_norm, target_dens_norm])
-    
-    gmm = GaussianMixture(n_components=n_clusters, covariance_type='full', 
-                            random_state=42, n_init=1, reg_covar=1e-2, max_iter=100, means_init=init_means)
-    labels = gmm.fit_predict(X_norm)
-
-    # # 使用KMeans进行3分类
-    # n_clusters = 3
-    # kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    # labels = kmeans.fit_predict(X_norm)
-    
-    # 将簇按深度中心排序，保证层号与深度呈单调关系
-    cluster_mean_depth = []
-    for k in range(n_clusters):
-        cluster_mask = labels == k
-        if np.any(cluster_mask):
-            cluster_mean_depth.append((k, depth_rest[cluster_mask].mean()))
-        else:
-            cluster_mean_depth.append((k, np.inf))
-    # 按深度排序
-    ordered = [k for k, _ in sorted(cluster_mean_depth, key=lambda x: x[1])]
-
-    # 重新映射标签
-    label_map = {old: new for new, old in enumerate(ordered)}
-    ordered_labels = np.array([label_map[l] for l in labels])
-
-    prob = gmm.predict_proba(X_norm)
-    # 重新排列概率矩阵的列顺序
-    prob = prob[:, ordered]
-    print(prob)
-    # 重新分配概率模糊的点到第1和第3簇
-    max_proba = prob.max(axis=1)
-    fuzzy_threshold = 0.59
-    fuzzy_mask = max_proba < fuzzy_threshold
-    for i in np.where(fuzzy_mask)[0]:
-        if prob[i, 0] > prob[i, 2]:
-            ordered_labels[i] = 0
-        else:
-            ordered_labels[i] = 2
-
-    # 计算每个层的边界（确保不重叠）
-    # 按深度排序数据
-    sort_idx = np.argsort(depth_rest)
-    depth_sorted = depth_rest[sort_idx]
-    labels_sorted = ordered_labels[sort_idx]
-    density_sorted = density_rest[sort_idx]
-    
-    # 找到每个簇的边界，确保不重叠
-    prev_end = L1_edge  # L1的结束位置
-    layerlist = [2, 4, 5]
-    for cluster_idx in range(n_clusters):
-        cluster_mask = labels_sorted == cluster_idx
-        if not np.any(cluster_mask):
-            continue
-        
-        cluster_depths = depth_sorted[cluster_mask]
-        cluster_densities = density_sorted[cluster_mask]
-        
-        # 该簇的起始位置为前一层的结束位置
-        start = prev_end
-        # 该簇的结束位置为簇内最大深度
-        end = cluster_depths.max()
-        
-        # 如果是最后一个簇，结束位置设为1.0
-        if cluster_idx == n_clusters - 1:
-            end = 1.0
-        else:
-            # 找到下一个簇的最小深度，取中点作为边界
-            next_cluster_mask = labels_sorted == cluster_idx + 1
-            if np.any(next_cluster_mask):
-                next_min = depth_sorted[next_cluster_mask].min()
-                # 边界设为当前簇最大值和下一簇最小值的中点
-                end = (cluster_depths.max() + next_min) / 2
-        
-        # 计算该层的平均密度（使用原始深度范围内的数据）
-        layer_mask = (depth_rest >= start) & (depth_rest < end)
-        if cluster_idx == n_clusters - 1:
-            layer_mask = (depth_rest >= start) & (depth_rest <= end)
-        mean_d = float(np.mean(density_rest[layer_mask])) if np.any(layer_mask) else 0
-        
-        layer = {
-            'layer': layerlist[cluster_idx],
-            'start': float(start),
-            'end': float(end),
-            'mean_density': mean_d
+    return [
+        {
+            "layer": names[i],
+            "start": float(boundaries[i]),
+            "end": float(boundaries[i + 1]),
+            "mean_density": _mean_density_for_range(depth, density, boundaries[i], boundaries[i + 1]),
         }
-        layers.append(layer)
-        prev_end = end
-    
-    # 细分L2为L2和L3
-    if len(layers) >= 2:
-        L2 = layers[1]
-        # 提取L2范围内的数据
-        mask_l2 = (depth_list >= L2['start']) & (depth_list < L2['end'])
-        depth_l2 = depth_list[mask_l2]
-        density_l2 = avg_density[mask_l2]
-        
-        if len(depth_l2) > 0:
-            # 使用梯度法细分L2为L2和L3
-            # sub_layers = segmentLayer_gradient(density_l2, depth_l2, n_layers=2, 
-            #                                    sigma=1, isshow=False, issave=False)
-            # 使用kmeans法细分L2为L2和L3
-            sub_layers = segmentLayer_kmeans(density_l2, depth_l2, n_clusters=2, isshow=False, issave=False)
-            if len(sub_layers) == 2:
-                # 更新L2和添加L3
-                L2_updated = sub_layers[0]
-                L3 = sub_layers[1]
-                L3['end'] = L2['end']  # 保持L3的结束位置为原L2的结束位置
-                
-                L2['end'] = L2_updated['end']
-                L2['mean_density'] = L2_updated['mean_density']
-                
-                L3_dict = {
-                    'layer': 3,
-                    'start': L2['end'],
-                    'end': L3['end'],
-                    'mean_density': L3['mean_density']
-                }
-                layers.insert(2, L3_dict)  # 插入到L2后面
-    # 细分L5为L5和L6
-    if len(layers) >= 5:
-        L5 = layers[4]
-        # 提取L5范围内的数据
-        mask_l5 = (depth_list >= L5['start']) & (depth_list < L5['end'])
-        depth_l5 = depth_list[mask_l5]
-        density_l5 = avg_density[mask_l5]
-        
-        if len(depth_l5) > 0:
-            # 使用梯度法细分L5为L5和L6
-            # sub_layers = segmentLayer_gradient(density_l5, depth_l5, n_layers=2, 
-            # #                                    sigma=1, isshow=False, issave=False)
-            sub_layers = segmentLayer_kmeans(density_l5, depth_l5, n_clusters=2, isshow=False, issave=False)
-            if len(sub_layers) == 2:
-                # 更新L5和添加L6
-                L5_updated = sub_layers[0]
-                L6 = sub_layers[1]
-                
-                L5['end'] = L5_updated['end']
-                L5['mean_density'] = L5_updated['mean_density']
-                
-                L6_dict = {
-                    'layer': 6,
-                    'start': L5['end'],
-                    'end': L6['end'],
-                    'mean_density': L6['mean_density']
-                }
-                layers.insert(5, L6_dict)  # 插入到L5后面
-    
-    # for L in layers:
-    #     if L['layer'] == 4:
-    #         L['end'] = 0.71;
-    #     if L['layer'] == 5:
-    #         L['start'] = 0.71;
-    
+        for i in range(len(names))
+    ]
 
-    if isshow:
-        _visualize_layers(layers, depth_list, avg_density, 'Multi-Method', 
-                          issave, 'depth_density_layers_custom.png')
-    
-    # 计算层间密度差异验证
-    _compute_layer_density_diff(layers, 'Custom')
 
+def _build_layers(boundaries, names, depth, density):
+    """
+    根据边界数组和层名构造标准分层结果。
+
+    参数:
+        boundaries:
+            单调递增的边界列表，长度应为层数 + 1。
+        names:
+            层名列表，例如 ["1", "2/3", "4", "5/6"]。
+        depth:
+            分箱后的 depth 坐标。
+        density:
+            分箱后的 density 曲线。
+
+    返回:
+        list[dict]
+            可直接写入 segmented_layers.csv 的结构。
+    """
+    layers = []
+    for i, name in enumerate(names):
+        start = float(boundaries[i])
+        end = float(boundaries[i + 1])
+        layers.append(
+            {
+                "layer": name,
+                "start": start,
+                "end": end,
+                "mean_density": _mean_density_for_range(depth, density, start, end),
+            }
+        )
     return layers
 
 
-def segmentLayer(avg_density, depth_list, offset=True, isshow=True, issave=True, method='kmeans', n_clusters=6, **kwargs):
-    method = method.lower()
-    
-    if method == 'kmeans':
-        return segmentLayer_kmeans(avg_density, depth_list, n_clusters=n_clusters, 
-                                   offset=offset, isshow=isshow, issave=issave)
-    elif method == 'gradient':
-        sigma = kwargs.get('sigma', 2)
-        return segmentLayer_gradient(avg_density, depth_list, n_layers=n_clusters,
-                                     sigma=sigma, isshow=isshow, issave=issave)
-    elif method == 'second_derivative' or method == '2nd_derivative':
-        sigma = kwargs.get('sigma', 3)
-        return segmentLayer_second_derivative(avg_density, depth_list, n_layers=n_clusters,
-                                              sigma=sigma, isshow=isshow, issave=issave)
-    elif method == 'gmm':
-        return segmentLayer_gmm(avg_density, depth_list, n_clusters=n_clusters,
-                                isshow=isshow, issave=issave)
-    elif method == 'multi_threshold':
-        return segmentLayer_multi_threshold(avg_density, depth_list, n_layers=n_clusters,
-                                            isshow=isshow, issave=issave)
-    elif method == 'dbscan':
-        eps = kwargs.get('eps', 0.15)
-        min_samples = kwargs.get('min_samples', 2)
-        return segmentLayer_dbscan(avg_density, depth_list, eps=eps, min_samples=min_samples,
-                                   isshow=isshow, issave=issave)
-    elif method == 'custom':
-        return customSegmentPipeline(avg_density, depth_list, isshow=isshow, issave=issave)
+def _save_peak_plot(
+    layers,
+    depth,
+    density,
+    smooth_density,
+    first_derivative,
+    second_derivative,
+    peak_indices,
+    zero_crossings,
+    merge_layer23,
+    save_path,
+):
+    """
+    保存 peak-based 分层算法诊断图。
+
+    参数:
+        layers:
+            最终分层结果列表。
+        depth:
+            分箱后的 depth 坐标。
+        density:
+            原始分箱密度曲线。
+        smooth_density:
+            高斯平滑后的密度曲线。
+        first_derivative:
+            平滑密度曲线的一阶导数。
+        second_derivative:
+            平滑密度曲线的二阶导数。
+        peak_indices:
+            两个主峰在 depth/density 数组中的索引：
+            第一个视为 L2 或 L2/3 peak，第二个视为 L4 peak。
+            如果未找到峰，则对应位置为 None。
+        zero_crossings:
+            二阶导数过零点对应的 depth 值。
+        merge_layer23:
+            是否合并 L2/L3，用于标题和 peak 标签。
+        save_path:
+            输出 PNG 路径。
+
+    输出图结构:
+        上图:
+            原始密度曲线、平滑密度曲线、分层色带、主峰位置。
+        中图:
+            一阶导数，用于观察密度变化趋势。
+        下图:
+            二阶导数和过零点，用于展示候选分层边界来源。
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    cmap = plt.get_cmap("tab10")
+    ymax = float(max(np.max(density), np.max(smooth_density), 1e-12))
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+
+    # 1) 上图：depth-density 曲线、平滑曲线、主峰和最终层边界。
+    ax1 = axes[0]
+    for i, layer in enumerate(layers):
+        color = cmap(i % 10)
+        ax1.axvspan(layer["start"], layer["end"], color=color, alpha=0.18)
+        mid = (layer["start"] + layer["end"]) / 2.0
+        ax1.text(mid, ymax * 0.95, f"L{layer['layer']}", ha="center", va="top", fontsize=10, color=color, fontweight="bold")
+
+    ax1.plot(depth, density, "o-", color="C1", alpha=0.5, label="Raw Density", markersize=4)
+    ax1.plot(depth, smooth_density, "-", color="C0", linewidth=2, label="Smoothed Density")
+
+    for peak_idx, color, label in zip(
+        peak_indices,
+        ["red", "purple"],
+        ["L2/3 Peak" if merge_layer23 else "L2 Peak", "L4 Peak"],
+    ):
+        if peak_idx is None:
+            continue
+        ax1.axvline(depth[peak_idx], color=color, linestyle="--", alpha=0.8, label=f"{label} ({depth[peak_idx]:.2f})")
+        ax1.scatter([depth[peak_idx]], [smooth_density[peak_idx]], color="red", s=100, zorder=5, marker="*")
+
+    if merge_layer23:
+        title = "Peak-Based Layer Segmentation (4 Layers: L1, L2/3, L4, L5/6)"
     else:
-        raise ValueError(f"未知的分层方法: {method}. 可选方法: 'kmeans', 'gradient', 'second_derivative', 'gmm', 'multi_threshold', 'dbscan'")
-    
+        title = "Peak-Based Layer Segmentation (5 Layers: L1, L2, L3, L4, L5/6)"
+    ax1.set_xlabel("Depth (GM -> WM)", fontsize=11)
+    ax1.set_ylabel("Cell Density", fontsize=11)
+    ax1.set_title(title, fontsize=12)
+    ax1.legend(loc="upper right", fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    # 2) 中图：一阶导数。峰附近的导数变化反映密度上升/下降趋势。
+    ax2 = axes[1]
+    ax2.plot(depth, first_derivative, "-", color="green", linewidth=1.5)
+    ax2.axhline(0, color="gray", linestyle="-", alpha=0.5)
+    for peak_idx, color in zip(peak_indices, ["red", "purple"]):
+        if peak_idx is not None:
+            ax2.axvline(depth[peak_idx], color=color, linestyle="--", alpha=0.5)
+    ax2.set_xlabel("Depth", fontsize=11)
+    ax2.set_ylabel("1st Derivative (Gradient)", fontsize=11)
+    ax2.set_title("First Derivative of Density", fontsize=12)
+    ax2.grid(True, alpha=0.3)
+
+    # 3) 下图：二阶导数。过零点是候选层边界的重要依据。
+    ax3 = axes[2]
+    ax3.plot(depth, second_derivative, "-", color="orange", linewidth=1.5)
+    ax3.axhline(0, color="gray", linestyle="-", alpha=0.5)
+    for crossing in zero_crossings:
+        ax3.axvline(crossing, color="blue", linestyle=":", alpha=0.6)
+    for peak_idx, color in zip(peak_indices, ["red", "purple"]):
+        if peak_idx is not None:
+            ax3.axvline(depth[peak_idx], color=color, linestyle="--", alpha=0.5)
+    ax3.set_xlabel("Depth", fontsize=11)
+    ax3.set_ylabel("2nd Derivative", fontsize=11)
+    ax3.set_title("Second Derivative (Zero-crossings = Layer Boundaries)", fontsize=12)
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
 
 
-if __name__ == "__main__":
-    wm = "input/WM_40x.csv"
-    gm = "input/GM_40x.csv"
-    cell = "output/nuclei_centroids.csv"
-    depth, density = analyze(wm, gm, cell)
+def segmentLayer_peak_based(avg_density, depth_list, sigma=2, merge_layer23=True, issave=True, **_ignored):
+    """
+    基于 depth-density 曲线的 peak-based 自动分层算法。
 
-    visualize(depth, density, issave=True)
-    avg_density, depth_list = computeAverage(depth, density, mode='median', isshow=True, issave=True, issmooth=True)
+    参数:
+        avg_density:
+            computeAverage() 输出的平均密度曲线。
+        depth_list:
+            computeAverage() 输出的 bin 中心 depth。
+        sigma:
+            高斯平滑参数。值越大，密度曲线越平滑，但可能抹掉细节峰。
+        merge_layer23:
+            True:
+                输出 4 层：L1、L2/3、L4、L5/6。
+                这是当前 pipeline 默认设置。
+            False:
+                输出 5 层：L1、L2、L3、L4、L5/6。
+        issave:
+            是否保存 depth_density_layers_peak_based.png。
+        **_ignored:
+            兼容旧版本 isshow 等参数；精简版不使用。
 
-    # avg_density = gaussian_filter1d(avg_density, sigma=2)
+    返回:
+        list[dict]
+            每个元素对应一层，包含：
+            - layer: 层名；
+            - start: 该层起始 depth；
+            - end: 该层结束 depth；
+            - mean_density: 该层区间内平均密度。
 
-    # 可视化平均密度曲线
-    plt.figure(figsize=(8, 5))
-    plt.plot(depth_list, avg_density, marker='o', linestyle='-', color='C1')
-    plt.xlabel('Cell Depth (to GM)')
-    plt.ylabel('Average Cell Density')
-    plt.title('Average Cell Density vs. Depth')
-    plt.grid(True)
-    plt.show()
-    
-    
-    # 1. 'gradient': 密度梯度分析法
-    # 2. 'second_derivative': 二阶导数方法
-    # 3. 'kmeans': KMeans聚类（默认）
-    # 4. 'gmm': 高斯混合模型
-    # 5. 'multi_threshold': 多阈值分割法
-    # 6. 'DBSCAN': 密度聚类
-    # 7. 'custom': 自定义
-    
-    method = 'custom'  # 修改此处以切换方法
-    layers = segmentLayer(avg_density, depth_list, offset=False, isshow=True, issave=True, 
-                          method=method, n_clusters=4)
+    核心逻辑:
+        1. 按 depth 排序密度曲线；
+        2. 对密度曲线做高斯平滑；
+        3. 计算一阶和二阶导数；
+        4. 在 depth 0.05~0.8 范围内寻找两个主要密度峰；
+        5. 将较浅的峰视为 L2/L2-3 相关峰，较深的峰视为 L4 峰；
+        6. 用二阶导数过零点确定峰之间和峰两侧的层边界；
+        7. 根据 merge_layer23 决定是否合并 L2/L3；
+        8. 找不到足够峰值时使用默认分层边界。
+    """
+    # 输入曲线可能不是严格按 depth 排列，先排序保证后续求导和找峰稳定。
+    depth = np.asarray(depth_list, dtype=float)
+    density = np.asarray(avg_density, dtype=float)
+    order = np.argsort(depth)
+    depth = depth[order]
+    density = density[order]
 
-    # layers = customSegmentPipeline(avg_density, depth_list, isshow=True, issave=False)
-    
-    # 保存分层结果为 CSV 文件
-    layers_df = pd.DataFrame(layers)
-    layers_df.to_csv(os.path.join(output_dir, 'segmented_layers.csv'), index=False)
-    
-    # # 对比所有方法
-    # methods = ['kmeans', 'gradient', 'second_derivative', 'gmm', 'multi_threshold']
-    # for m in methods:
-    #     print(f"\n=== 使用方法: {m} ===")
-    #     layers = segmentLayer(avg_density, depth_list, method=m, isshow=True, issave=False, n_clusters=4, offset=False)
+    # 平滑曲线用于找峰和求导，避免单个 bin 的噪声导致层边界抖动。
+    smooth_density = gaussian_filter1d(density, sigma=sigma)
+    first_derivative = np.gradient(smooth_density, depth)
+    second_derivative = np.gradient(first_derivative, depth)
+
+    # 只在中间主要皮层范围找峰，避开最靠近 GM/WM 端点的边界效应。
+    search_mask = (depth >= 0.05) & (depth <= 0.8)
+    search_indices = np.where(search_mask)[0]
+    if len(search_indices) < 5:
+        search_indices = np.arange(len(depth))
+
+    # 先用 prominence 约束找明显峰；如果不足两个，再放宽为仅按距离找峰。
+    density_search = smooth_density[search_indices]
+    min_distance = max(3, len(search_indices) // 10)
+    prominence = np.ptp(density_search) * 0.1
+    peaks_local, _ = find_peaks(density_search, distance=min_distance, prominence=prominence)
+    if len(peaks_local) < 2:
+        peaks_local, _ = find_peaks(density_search, distance=min_distance)
+
+    peaks_global = search_indices[peaks_local]
+    peak_indices = [None, None]
+    zero_depths = np.asarray([], dtype=float)
+    if len(peaks_global) >= 2:
+        # 取高度最高的两个峰，并按 depth 从浅到深排序。
+        top_two = np.argsort(smooth_density[peaks_global])[-2:]
+        peak2_idx, peak4_idx = np.sort(peaks_global[top_two])
+        peak_indices = [int(peak2_idx), int(peak4_idx)]
+
+        # 二阶导数过零点作为候选边界。
+        zero_depths = _zero_crossing_depths(second_derivative, depth)
+        peak2_depth = depth[peak2_idx]
+        peak4_depth = depth[peak4_idx]
+
+        # L1/L2 边界：取 L2 峰左侧、最靠近峰的二阶导数过零点。
+        left_of_peak2 = [d for d in zero_depths if d < peak2_depth]
+        boundary_1_2 = max(left_of_peak2) if left_of_peak2 else peak2_depth * 0.5
+
+        # L2/L3 与 L3/L4 边界：优先使用两个峰之间的二阶导数过零点。
+        between_peaks = [d for d in zero_depths if peak2_depth < d < peak4_depth]
+        if between_peaks:
+            mid_point = (peak2_depth + peak4_depth) / 2.0
+            boundary_2_3 = min(between_peaks, key=lambda x: abs(x - mid_point * 0.7))
+            remaining = [d for d in between_peaks if d > boundary_2_3]
+            boundary_3_4 = min(remaining, key=lambda x: abs(x - mid_point * 1.3)) if remaining else (boundary_2_3 + peak4_depth) / 2.0
+        else:
+            boundary_2_3 = peak2_depth + (peak4_depth - peak2_depth) * 0.33
+            boundary_3_4 = peak2_depth + (peak4_depth - peak2_depth) * 0.67
+
+        # L4/L5-6 边界：取 L4 峰右侧、最靠近峰的二阶导数过零点。
+        right_of_peak4 = [d for d in zero_depths if d > peak4_depth]
+        boundary_4_56 = min(right_of_peak4) if right_of_peak4 else peak4_depth + (1.0 - peak4_depth) * 0.4
+
+        # 保证边界单调递增，避免异常曲线导致后续区间为空或倒置。
+        boundaries = [0.0, boundary_1_2, boundary_2_3, boundary_3_4, boundary_4_56, 1.0]
+        for i in range(1, len(boundaries)):
+            if boundaries[i] <= boundaries[i - 1]:
+                boundaries[i] = boundaries[i - 1] + 0.02
+        boundaries = np.clip(boundaries, 0.0, 1.0).tolist()
+
+        # 根据设置生成最终层结构。merge_layer23=True 时跳过 boundary_2_3。
+        if merge_layer23:
+            final_boundaries = [boundaries[0], boundaries[1], boundaries[3], boundaries[4], boundaries[5]]
+            layer_names = ["1", "2/3", "4", "5/6"]
+        else:
+            final_boundaries = boundaries
+            layer_names = ["1", "2", "3", "4", "5/6"]
+
+        layers = _build_layers(final_boundaries, layer_names, depth, density)
+    else:
+        # 如果找不到两个可靠峰，使用经验默认边界，保证 pipeline 有稳定输出。
+        layers = _default_layers(depth, density, merge_layer23)
+
+    if issave:
+        _save_peak_plot(
+            layers,
+            depth,
+            density,
+            smooth_density,
+            first_derivative,
+            second_derivative,
+            peak_indices,
+            zero_depths,
+            merge_layer23,
+            os.path.join(output_dir, "depth_density_layers_peak_based.png"),
+        )
+
+    return layers

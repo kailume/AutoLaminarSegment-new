@@ -1,15 +1,98 @@
+"""
+Layer segmentation visualization — per-pixel depth-based color assignment.
+
+Computes depth for each pixel via Euclidean distance transform from GM/WM
+boundaries, then assigns layer colors directly from depth thresholds.
+No column-by-column interpolation or contour-based boundary detection.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage import io
 import cv2
 import pandas as pd
 import os
-from scipy.interpolate import splprep, splev
-
 
 # 默认输入输出路径（可通过参数覆盖）
 input_dir = "input"
 output_dir = "output"
+COMPACT_RATE = 1.0  # 1.0 = 原图可视化；0.1 = 约等于原来的 10:1 压缩
+IMAGE_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".jp2", ".j2k"
+)
+
+
+def resolve_image_path(directory, filename):
+    """Resolve filename in directory, falling back to same-stem common image formats."""
+    base = filename if os.path.isabs(filename) else os.path.join(directory, filename)
+    if os.path.exists(base):
+        return base
+
+    parent = os.path.dirname(base)
+    name = os.path.basename(base)
+    stem, suffix = os.path.splitext(name)
+    if not suffix:
+        stem = name
+
+    for ext in IMAGE_EXTENSIONS:
+        for candidate_ext in (ext, ext.upper()):
+            candidate = os.path.join(parent, stem + candidate_ext)
+            if os.path.exists(candidate):
+                return candidate
+    return base
+
+
+def load_visualization_image(image_path):
+    """Load an image for visualization, supporting tif/tiff/png/jpg/jpeg and similar formats."""
+    image_path = str(image_path)
+    ext = os.path.splitext(image_path)[1].lower()
+    reader = None
+
+    if ext in {".tif", ".tiff"}:
+        try:
+            import tifffile
+            img = tifffile.imread(image_path)
+            reader = "tifffile"
+            # tifffile may warn about OME discontiguous storage but still return data;
+            # validate that the result is a sane image array (2D or 3D)
+            if not isinstance(img, np.ndarray) or img.ndim not in (2, 3):
+                raise ValueError("unexpected tifffile output")
+        except Exception:
+            img = io.imread(image_path)
+            reader = "skimage"
+    else:
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        reader = "cv2"
+        if img is None:
+            img = io.imread(image_path)
+            reader = "skimage"
+
+    if img is None:
+        raise ValueError(f"无法读取图像: {image_path}")
+
+    img = np.asarray(img)
+
+    # Drop singleton dimensions such as (H, W, 1).
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[:, :, 0]
+
+    # Convert unsupported channel layouts to a displayable form.
+    if img.ndim == 3 and img.shape[2] > 4:
+        img = img[:, :, :3]
+
+    # Normalize non-uint8 images for stable OpenCV visualization/saving.
+    if img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+        img = img.astype(np.uint8)
+
+    # `io.imread` returns RGB/RGBA while OpenCV uses BGR/BGRA.
+    if reader == "skimage":
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
+
+    return img
 
 
 def get_coords(df):
@@ -22,107 +105,110 @@ def get_coords(df):
         return df.iloc[:, :2].values
 
 
-def smooth_boundary_points(pts, smoothing_factor=0.01):
-    """
-    使用样条曲线平滑边界点，使绘制的边界更加光滑
-    """
-    if len(pts) < 4:
-        return pts
-    
-    # 去除重复点
-    unique_pts = []
-    for i, pt in enumerate(pts):
-        if i == 0 or not np.allclose(pt, pts[i-1]):
-            unique_pts.append(pt)
-    pts = np.array(unique_pts)
-    
-    if len(pts) < 4:
-        return pts
-    
-    try:
-        # 使用样条曲线拟合
-        x, y = pts[:, 0], pts[:, 1]
-        tck, u = splprep([x, y], s=len(pts) * smoothing_factor, per=False)
-        u_new = np.linspace(0, 1, len(pts) * 2)
-        x_new, y_new = splev(u_new, tck)
-        return np.column_stack([x_new, y_new]).astype(np.int32)
-    except Exception:
-        return pts
+def _clip_points_to_image(points, h, w, name):
+    """Keep only finite boundary points inside the image canvas."""
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        raise ValueError(f"{name} boundary must be an Nx2 coordinate array")
+
+    pts = pts[:, :2]
+    finite = np.isfinite(pts).all(axis=1)
+    in_bounds = (
+        finite
+        & (pts[:, 0] >= 0)
+        & (pts[:, 0] < w)
+        & (pts[:, 1] >= 0)
+        & (pts[:, 1] < h)
+    )
+    removed = int(len(pts) - np.count_nonzero(in_bounds))
+    if removed:
+        print(f"  [边界裁剪] {name}: 移除图外/无效点 {removed}/{len(pts)}")
+
+    clipped = np.rint(pts[in_bounds]).astype(np.int32)
+    if len(clipped) == 0:
+        raise ValueError(f"{name} boundary has no points inside image bounds ({w}x{h})")
+    return clipped
 
 
-def draw_boundary_curve(img, pts, color, thickness=3, label=None, label_pos='center'):
+def _compute_depth_map(h, w, gm_pts, wm_pts):
     """
-    绘制平滑的边界曲线
-    
-    Args:
-        img: 要绘制的图像
-        pts: 边界点坐标数组 (N, 2)
-        color: BGR颜色
-        thickness: 线条粗细
-        label: 边界标签文字
-        label_pos: 标签位置 ('center', 'start', 'end')
+    对全图每个像素计算归一化深度 (0→1)。
+
+    使用欧几里得距离变换：
+      depth = dist_to_GM / (dist_to_GM + dist_to_WM)
+    灰质边界 → 0，白质边界 → 1，中间连续过渡。
+    边界点会被限制在原始图像画布内，避免图外点影响深度场。
     """
-    if len(pts) < 2:
+    gm_pts = _clip_points_to_image(gm_pts, h, w, "GM(depth)")
+    wm_pts = _clip_points_to_image(wm_pts, h, w, "WM(depth)")
+
+    gm_mask = np.zeros((h, w), dtype=np.uint8)
+    wm_mask = np.zeros((h, w), dtype=np.uint8)
+
+    for pt in gm_pts:
+        px, py = int(pt[0]), int(pt[1])
+        gm_mask[py, px] = 255
+
+    for pt in wm_pts:
+        px, py = int(pt[0]), int(pt[1])
+        wm_mask[py, px] = 255
+
+    dist_gm = cv2.distanceTransform(255 - gm_mask, cv2.DIST_L2, 5)
+    dist_wm = cv2.distanceTransform(255 - wm_mask, cv2.DIST_L2, 5)
+
+    total = dist_gm + dist_wm + 1e-8
+    depth = dist_gm / total
+
+    return depth
+
+
+def _draw_dashed_points(img, pts, color, thickness, dash_len=20, gap_len=15):
+    """Draw dashed polylines through an Nx2 point array."""
+    n = pts.shape[0]
+    i = 0
+    while i < n:
+        end = min(i + dash_len, n)
+        if end - i >= 2:
+            seg = pts[i:end].reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(img, [seg], False, color, thickness)
+        i += dash_len + gap_len
+
+
+def _draw_dashed_contour(img, contour, color, thickness, dash_len=20, gap_len=15, valid_mask=None):
+    """沿轮廓绘制虚线（逐段交替画/不画）。"""
+    pts = contour.squeeze()
+    if pts.ndim != 2 or pts.shape[0] < 4 or pts.shape[1] != 2:
         return
-    
-    # 平滑边界点
-    smooth_pts = smooth_boundary_points(pts)
-    
-    # 转换为OpenCV格式
-    pts_cv = smooth_pts.reshape((-1, 1, 2)).astype(np.int32)
-    
-    # 绘制曲线
-    cv2.polylines(img, [pts_cv], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
-    
-    # 添加标签
-    if label:
-        if label_pos == 'center':
-            idx = len(smooth_pts) // 2
-        elif label_pos == 'start':
-            idx = min(10, len(smooth_pts) - 1)
-        else:  # end
-            idx = max(0, len(smooth_pts) - 10)
-        
-        label_pt = smooth_pts[idx]
-        
-        # 绘制标签背景
-        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
-        cv2.rectangle(img, 
-                     (int(label_pt[0]) - 5, int(label_pt[1]) - text_h - 10),
-                     (int(label_pt[0]) + text_w + 5, int(label_pt[1]) + 5),
-                     (0, 0, 0), -1)
-        cv2.putText(img, label, (int(label_pt[0]), int(label_pt[1])),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3, cv2.LINE_AA)
 
-def calculate_cell_depths(centroids_df, wm_path, gm_path):
-    from scipy.spatial.distance import cdist
-    
-    # 读取边界数据
-    try:
-        wm_df = pd.read_csv(wm_path)
-        gm_df = pd.read_csv(gm_path)
-    except Exception as e:
-        print(f"读取边界文件失败: {e}")
-        return None
+    if valid_mask is None:
+        _draw_dashed_points(img, pts, color, thickness, dash_len, gap_len)
+        return
 
-    wm_pts = get_coords(wm_df)
-    gm_pts = get_coords(gm_df)
-    cell_pts = centroids_df[['X', 'Y']].values
+    h, w = valid_mask.shape[:2]
+    current = []
+    for x, y in pts.astype(np.int32):
+        if 0 <= x < w and 0 <= y < h and valid_mask[y, x]:
+            current.append((x, y))
+            continue
 
-    print(f"正在计算深度... 细胞数:{len(cell_pts)}, WM点数:{len(wm_pts)}, GM点数:{len(gm_pts)}")
+        if len(current) >= 4:
+            _draw_dashed_points(
+                img, np.asarray(current, dtype=np.int32), color, thickness, dash_len, gap_len
+            )
+        current = []
 
-    # 计算距离 (注意：如果点很多，cdist可能会内存溢出，这里假设数据量适中)
-    # 如果数据量大，应该用 KDTree
-    dist_wm = cdist(cell_pts, wm_pts).min(axis=1)
-    dist_gm = cdist(cell_pts, gm_pts).min(axis=1)
+    if len(current) >= 4:
+        _draw_dashed_points(
+            img, np.asarray(current, dtype=np.int32), color, thickness, dash_len, gap_len
+        )
 
-    depths = dist_gm / (dist_wm + dist_gm + 1e-8)
-    return depths
 
-def assign_layers_to_mask(wm_path, gm_path, layers_csv_path, image_path, issave=True, save_dir=None):
+def assign_layers_to_mask(wm_path, gm_path, layers_csv_path, image_path,
+                          issave=True, save_dir=None, mask_img=None,
+                          compact=False, compact_rate=None):
     """
-    在图像上绘制分层线进行可视化
-    
+    在图像上生成分层颜色填充Mask — 基于逐像素深度值直接赋予层颜色。
+
     Args:
         wm_path: 白质边界CSV文件路径
         gm_path: 灰质边界CSV文件路径
@@ -130,378 +216,261 @@ def assign_layers_to_mask(wm_path, gm_path, layers_csv_path, image_path, issave=
         image_path: 原始图像路径
         issave: 是否保存结果
         save_dir: 保存目录（如果为None则使用默认output_dir）
+        mask_img: 二值掩码（uint8），用于限定有效组织区域
+        compact: 兼容旧参数；True 时等同 compact_rate=0.1
+        compact_rate: 可视化降采样比例，1 不压缩，0.1 约等于原 10:1 压缩
     """
     global output_dir
     if save_dir is not None:
         output_dir = save_dir
-    
-    # 读取分层结果
+
+    # -- 读取分层定义 --
     layers_df = pd.read_csv(layers_csv_path)
     layers = layers_df.to_dict('records')
     print(f"已加载分层定义: {len(layers)} 层")
 
-    # 读取原图用于可视化
-    orig_img = cv2.imread(image_path)
+    # -- 读取原始图像 --
+    orig_img = load_visualization_image(image_path)
+    if orig_img is None:
+        raise ValueError(f"无法读取原始图像: {image_path}")
     h, w = orig_img.shape[:2]
-    vis_img = orig_img.copy()
 
-    # 计算全图深度场 (Depth Map) 用于绘制分层线
+    # -- 加载 GM/WM 边界坐标 --
     wm_df = pd.read_csv(wm_path)
     gm_df = pd.read_csv(gm_path)
-
-    # 获取边界点坐标
     wm_pts = get_coords(wm_df)
     gm_pts = get_coords(gm_df)
-    
     print(f"GM边界点数: {len(gm_pts)}, WM边界点数: {len(wm_pts)}")
+    gm_pts = _clip_points_to_image(gm_pts, h, w, "GM")
+    wm_pts = _clip_points_to_image(wm_pts, h, w, "WM")
+    print(f"  图内边界点数: GM={len(gm_pts)}, WM={len(wm_pts)}")
 
-    # def get_dist_map(pts_df, h, w):
-    #     mask = np.zeros((h, w), dtype=np.uint8)
-    #     cols = pts_df.columns
-    #     x_col = 'x' if 'x' in cols else 'X'
-    #     y_col = 'y' if 'y' in cols else 'Y'
-        
-    #     pts = pts_df[[x_col, y_col]].values
-    #     for pt in pts:
-    #         px, py = int(pt[0]), int(pt[1])
-    #         if 0 <= px < w and 0 <= py < h:
-    #             mask[py, px] = 255
-        
-    #     dist_mask = 255 - mask
-    #     dist = cv2.distanceTransform(dist_mask, cv2.DIST_L2, 5)
-    #     return dist
-
-    def get_dist_map(pts_df, h, w):
-        cols = pts_df.columns
-        x_col = 'x' if 'x' in cols else 'X'
-        y_col = 'y' if 'y' in cols else 'Y'
-        pts = pts_df[[x_col, y_col]].values
-        
-        # 计算所有点的范围，确定需要扩展的边界
-        min_x, max_x = int(pts[:, 0].min()), int(pts[:, 0].max())
-        min_y, max_y = int(pts[:, 1].min()), int(pts[:, 1].max())
-        
-        # 计算偏移量（将坐标平移到正数范围）
-        offset_x = max(0, -min_x)
-        offset_y = max(0, -min_y)
-        
-        # 扩展后的画布尺寸
-        ext_w = max(w, max_x + 1) + offset_x
-        ext_h = max(h, max_y + 1) + offset_y
-        
-        # 在扩展画布上标记边界点
-        mask = np.zeros((ext_h, ext_w), dtype=np.uint8)
-        for pt in pts:
-            px, py = int(pt[0]) + offset_x, int(pt[1]) + offset_y
-            if 0 <= px < ext_w and 0 <= py < ext_h:
-                mask[py, px] = 255
-        
-        # 计算距离变换
-        dist_mask = 255 - mask
-        dist = cv2.distanceTransform(dist_mask, cv2.DIST_L2, 5)
-        
-        # 裁剪回原始图像大小
-        dist_cropped = dist[offset_y:offset_y + h, offset_x:offset_x + w]
-        return dist_cropped
-
-
-    print("正在计算全图深度场...")
-    dist_wm = get_dist_map(wm_df, h, w)
-    dist_gm = get_dist_map(gm_df, h, w)
-    total_dist = dist_wm + dist_gm + 1e-8
-    depth_map = dist_gm / total_dist
-
-    # # 绘制深度场图
-    # depth_map_normalized = (depth_map * 255).astype(np.uint8)
-    # depth_colored = cv2.applyColorMap(depth_map_normalized, cv2.COLORMAP_JET)
-    # if issave:
-    #     cv2.imwrite(f'{output_dir}\\depth_map.png', depth_colored)
-    #     print(f"深度场图已保存为 {output_dir}\\depth_map.png")
-
-    line_thickness = max(50, min(h, w) // 200)
-    # ============ 绘制GM和WM边界曲线 ============
-    gm_color = (255, 0, 255)
-    gm_thickness = max(5, min(h, w) // 300)  # 根据图像大小自适应线条粗细
-    draw_boundary_curve(vis_img, gm_pts, gm_color, thickness=line_thickness, label="GM", label_pos='center')
-    
-    wm_color = (255, 255, 0)
-    draw_boundary_curve(vis_img, wm_pts, wm_color, thickness=line_thickness, label="WM", label_pos='center')
-    
-
-    # ============ 绘制分层线 ============
-    cmap = plt.get_cmap('tab10')
-    
-    for i, layer in enumerate(layers):
-        boundary_depth = layer['end']
-        if boundary_depth > 0.99: continue
-
-        rgba = cmap(i % 10)
-        color_bgr = (int(rgba[2]*255), int(rgba[1]*255), int(rgba[0]*255))
-
-        thresh_map = (depth_map <= boundary_depth).astype(np.uint8) * 255
-        # 检查是否是Layer 2或Layer 5（支持字符串和整数类型）
-        layer_id = str(layer['layer'])
-        if layer_id == '2' or layer_id == '5' or layer_id == '5/6':
-            line_type = cv2.LINE_AA
-            line_style = (5, 10)  # 5像素实线，10像素空白
+    # -- 确定组织掩码（mask内像素才会被填色） --
+    _mask_loaded_from = None
+    mask = None
+    if mask_img is not None:
+        if mask_img.shape[:2] == (h, w):
+            mask = mask_img
+            _mask_loaded_from = "外部mask（来自 pipeline）"
         else:
-            line_type = cv2.LINE_AA
-            line_style = None
+            print(f"  外部mask尺寸 {mask_img.shape[:2]} 与图像 ({h},{w}) 不匹配，自动resize")
+            mask = cv2.resize(mask_img, (w, h), interpolation=cv2.INTER_NEAREST)
+            _mask_loaded_from = "外部mask（resized）"
+        print(f"  使用{_mask_loaded_from}，有效像素: {np.count_nonzero(mask)}")
 
-        contours, _ = cv2.findContours(thresh_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # 尝试从 input / output 目录加载默认灰度掩码
+    if mask is None:
+        for p in [
+            resolve_image_path(output_dir, 'grayMask_40x.png'),
+            resolve_image_path(input_dir, 'grayMask_40x.png'),
+            resolve_image_path(input_dir, 'mask.png'),
+        ]:
+            # 大图可能超出 OpenCV 像素限制，fallback 到 skimage
+            tmp = None
+            try:
+                tmp = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                tmp = None
+            if tmp is None:
+                try:
+                    from skimage import io as _io
+                    tmp = _io.imread(p)
+                    if tmp.ndim == 3:
+                        tmp = tmp[:, :, 0]
+                    tmp = (tmp > 0).astype(np.uint8) * 255
+                except Exception:
+                    tmp = None
+            if tmp is None:
+                try:
+                    from PIL import Image as _PIL
+                    import PIL
+                    _saved = PIL.Image.MAX_IMAGE_PIXELS
+                    PIL.Image.MAX_IMAGE_PIXELS = None
+                    _pil_img = _PIL.open(p)
+                    tmp = np.array(_pil_img.convert("L"))
+                    PIL.Image.MAX_IMAGE_PIXELS = _saved
+                    tmp = (tmp > 0).astype(np.uint8) * 255
+                except Exception:
+                    tmp = None
+            if tmp is not None and tmp.shape[:2] == (h, w):
+                mask = tmp
+                _mask_loaded_from = p
+                break
 
-        # 过滤掉位于图像边界的点（x==0, x==w-1, y==0, y==h-1）以避免绘制贴边线
-        filtered_contours = []
-        for c in contours:
-            pts = c.reshape(-1, 2)
-            # 保留不在边界上的点
-            mask = (pts[:, 0] > 0) & (pts[:, 0] < (w - 1)) & (pts[:, 1] > 0) & (pts[:, 1] < (h - 1))
-            if mask.sum() >= 2:
-                kept = pts[mask].astype(np.int32).reshape(-1, 1, 2)
-                filtered_contours.append(kept)
+    if mask is not None:
+        print(f"  有效组织掩码已加载 ({_mask_loaded_from})，非零像素: {np.count_nonzero(mask)}")
+    else:
+        print(f"  [信息] 未加载掩码，将使用全图深度填色")
 
-        # 只有存在经过过滤后的轮廓才绘制
-        if filtered_contours:
-            # 忽略过远点：将轮廓按点间距拆分为连续段，仅绘制点间距不超过阈值的段
-            segments = []
-            # 距离阈值：取图像对角线的一个小比例作为最大允许间距（可根据需要调整）
-            max_gap = np.hypot(w, h) * 0.05
+    if compact_rate is None:
+        compact_rate = 0.1 if compact else COMPACT_RATE
+    compact_rate = float(compact_rate)
+    if compact_rate <= 0 or compact_rate > 1:
+        raise ValueError(f"compact_rate must be in (0, 1], got {compact_rate}")
 
-            for c in filtered_contours:
-                pts = c.reshape(-1, 2).astype(np.float32)
-                if pts.shape[0] < 2:
-                    continue
+    # -- Compact 模式：按 compact_rate 对最终可视化降采样 --
+    if compact_rate < 1:
+        scale = compact_rate
+        small_w = max(int(round(w * scale)), 1)
+        small_h = max(int(round(h * scale)), 1)
+        orig_img = cv2.resize(orig_img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        h, w = small_h, small_w
 
-                # 计算相邻点距离
-                d = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
-                # 找到需要分割的位置（距离大于阈值）
-                split_idx = np.where(d > max_gap)[0]
+        # 边界坐标同步缩放，并保持在缩略图画布内
+        wm_pts = np.rint(wm_pts * scale).astype(np.int32)
+        gm_pts = np.rint(gm_pts * scale).astype(np.int32)
+        wm_pts[:, 0] = np.clip(wm_pts[:, 0], 0, w - 1)
+        wm_pts[:, 1] = np.clip(wm_pts[:, 1], 0, h - 1)
+        gm_pts[:, 0] = np.clip(gm_pts[:, 0], 0, w - 1)
+        gm_pts[:, 1] = np.clip(gm_pts[:, 1], 0, h - 1)
 
-                start = 0
-                for idx in split_idx:
-                    seg = pts[start:idx+1]
-                    if seg.shape[0] >= 2:
-                        segments.append(seg.astype(np.int32).reshape(-1, 1, 2))
-                    start = idx + 1
+        # 掩码同步缩放
+        if mask is not None:
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-                # 添加最后一段
-                seg = pts[start:]
-                if seg.shape[0] >= 2:
-                    segments.append(seg.astype(np.int32).reshape(-1, 1, 2))
+        print(f"  Compact模式: rate={compact_rate}, 降采样至 ({h}, {w})")
 
-            # 绘制所有连续段
-            if segments:
-                cv2.polylines(vis_img, segments, isClosed=False, color=color_bgr, thickness=line_thickness, lineType=cv2.LINE_AA)
+    # -- 计算全图深度场（每个像素独立计算，与列插值无关） --
+    print("正在计算全图深度场（距离变换）...")
+    depth_map = _compute_depth_map(h, w, gm_pts, wm_pts)
+    print(f"  深度范围: {depth_map.min():.3f} ~ {depth_map.max():.3f}")
 
-                # 添加分层标签：基于最长的段
-                best_seg = max(segments, key=lambda s: s.shape[0])
-                if best_seg.shape[0] > 0:
-                    pt = best_seg[best_seg.shape[0] // 2][0]
-                    label_text = f"L{layer['layer']}"
-                    font_scale = max(0.8, min(h, w) / 2000)
-                    font_thickness = max(2, int(font_scale * 2))
-
-                    # 绘制标签背景
-                    (text_w, text_h), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-                    cv2.rectangle(vis_img, 
-                                 (pt[0] - 3, pt[1] - text_h - 5),
-                                 (pt[0] + text_w + 3, pt[1] + 3),
-                                 (0, 0, 0), -1)
-                    cv2.putText(vis_img, label_text, (pt[0], pt[1]), 
-                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_bgr, font_thickness, cv2.LINE_AA)
-    
-    # 尝试从output_dir或input_dir读取灰质掩码
-    grayMask = cv2.imread(os.path.join(output_dir, 'grayMask_40x.png'), cv2.IMREAD_GRAYSCALE)
-    if grayMask is None:
-        grayMask = cv2.imread(os.path.join(input_dir, 'grayMask_40x.png'), cv2.IMREAD_GRAYSCALE)
-    if grayMask is not None:
-        # 创建3通道掩码
-        mask_3ch = cv2.cvtColor(grayMask, cv2.COLOR_GRAY2BGR)
-        # 将掩码区域设为黑色
-        vis_img[mask_3ch == 0] = 0
-
-    # # ============ 添加图例 ============
-    # legend_x = 30
-    # legend_y = 50
-    # legend_spacing = 40
-    # legend_font_scale = max(0.8, min(h, w) / 2500)
-    # legend_thickness = max(2, int(legend_font_scale * 2))
-    
-    # # 图例背景
-    # legend_items = [("GM Boundary", gm_color), ("WM Boundary", wm_color)]
-    # for i, layer in enumerate(layers):
-    #     rgba = cmap(i % 10)
-    #     color_bgr = (int(rgba[2]*255), int(rgba[1]*255), int(rgba[0]*255))
-    #     legend_items.append((f"Layer {layer['layer']}", color_bgr))
-    
-    # legend_height = len(legend_items) * legend_spacing + 20
-    # legend_width = 250
-    # cv2.rectangle(vis_img, (legend_x - 10, legend_y - 30), 
-    #              (legend_x + legend_width, legend_y + legend_height - 20), 
-    #              (40, 40, 40), -1)
-    # cv2.rectangle(vis_img, (legend_x - 10, legend_y - 30), 
-    #              (legend_x + legend_width, legend_y + legend_height - 20), 
-    #              (200, 200, 200), 2)
-    
-    # for i, (label, color) in enumerate(legend_items):
-    #     y_pos = legend_y + i * legend_spacing
-    #     # 绘制颜色示例线
-    #     cv2.line(vis_img, (legend_x, y_pos), (legend_x + 40, y_pos), color, 4, cv2.LINE_AA)
-    #     # 绘制文字
-    #     cv2.putText(vis_img, label, (legend_x + 55, y_pos + 5), 
-    #                cv2.FONT_HERSHEY_SIMPLEX, legend_font_scale, (255, 255, 255), legend_thickness, cv2.LINE_AA)
-
-    if issave:
-        cv2.imwrite(f'{output_dir}\\layers_lines.png', vis_img)
-        print(f"分层线图已保存为 {output_dir}\\layers_lines.png")
-
-    # ============ 生成分层颜色填充Mask ============
-    # 每层使用不同颜色填充，不包含任何文字标签
-    layer_color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # 定义层颜色（使用更鲜明的配色方案）
+    # -- 定义层颜色（BGR） --
     layer_colors = [
-        (255, 100, 100),   # Layer 1 - 浅红色
-        (100, 255, 100),   # Layer 2 - 浅绿色
-        (100, 100, 255),   # Layer 3 - 浅蓝色
+        (255, 100, 100),   # Layer 1 - 浅红
+        (100, 255, 100),   # Layer 2 - 浅绿
+        (100, 100, 255),   # Layer 3 - 浅蓝
         (255, 255, 100),   # Layer 4 - 黄色
         (255, 100, 255),   # Layer 5 - 粉色
         (100, 255, 255),   # Layer 6 - 青色
-        (255, 180, 100),   # Layer 7 - 橙色（备用）
-        (180, 100, 255),   # Layer 8 - 紫色（备用）
+        (255, 180, 100),   # Layer 7 - 橙色
+        (180, 100, 255),   # Layer 8 - 紫色
     ]
-    
-    # 先填充白质区域（最内层，depth >= 最后一层的end）
-    # 白质用白色表示
-    if len(layers) > 0:
-        last_layer_end = layers[-1]['end']
-        wm_region = (depth_map >= last_layer_end).astype(np.uint8) * 255
-        layer_color_mask[wm_region == 255] = (255, 255, 255)  # 白色表示白质
-    
-    # 按层序填充区域（从外到内，即从GM到WM）
+
+    # -- 直接根据深度值给每个像素赋予对应层级的颜色 --
+    layer_color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+
     for i, layer in enumerate(layers):
         layer_start = layer['start']
         layer_end = layer['end']
-        
-        # 获取当前层的颜色
-        color_idx = i % len(layer_colors)
-        fill_color = layer_colors[color_idx]
-        
-        # 创建当前层的mask：depth在[start, end]范围内
-        layer_region = ((depth_map >= layer_start) & (depth_map < layer_end)).astype(np.uint8) * 255
-        
-        # 填充颜色
-        layer_color_mask[layer_region == 255] = fill_color
-    
-    # 应用灰质掩码（只显示灰质区域内的分层）
-    # 但保留白质区域的显示
-    if grayMask is not None:
-        # 创建包含灰质和白质的组合掩码
-        if len(layers) > 0:
-            last_layer_end = layers[-1]['end']
-            wm_mask = (depth_map >= last_layer_end).astype(np.uint8) * 255
-            combined_mask = cv2.bitwise_or(grayMask, wm_mask)
-        else:
-            combined_mask = grayMask
-        mask_3ch = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
-        layer_color_mask[mask_3ch == 0] = 0
-    
+        color = layer_colors[i % len(layer_colors)]
+
+        # 深度在 [start, end) 范围内的像素赋予对应颜色
+        region = (depth_map >= layer_start) & (depth_map < layer_end)
+        layer_color_mask[region] = color
+
+    # mask 裁剪：不在掩码内的像素强制置黑（确保 mask 始终生效）
+    if mask is not None:
+        layer_color_mask[mask == 0] = 0
+        filled_px = np.count_nonzero(np.any(layer_color_mask > 0, axis=2))
+        print(f"  Mask裁剪后非零像素: {filled_px} / {h * w}")
+
+    # -- 生成 Overlay：mask 叠加到原图 --
+    if len(orig_img.shape) == 2:
+        orig_bgr = cv2.cvtColor(orig_img, cv2.COLOR_GRAY2BGR)
+    elif orig_img.shape[2] == 4:
+        orig_bgr = cv2.cvtColor(orig_img, cv2.COLOR_BGRA2BGR)
+    else:
+        orig_bgr = orig_img.copy()
+
+    alpha = 0.4
+    overlay_img = cv2.addWeighted(layer_color_mask, alpha, orig_bgr, 1 - alpha, 0)
+    # overlay 仅在 mask 内显示彩色叠加层，mask 外保留原图
+    if mask is not None:
+        overlay_img[mask == 0] = orig_bgr[mask == 0]
+
+    # -- 生成分层线图像（粗白色虚线）--
+    print("正在生成分层线图像...")
+    # 先在空白画布上绘制虚线，再合成到原图上（保持 mask 外原图完整）
+    line_canvas = np.zeros_like(orig_bgr)
+    line_thickness = 10
+    line_valid_mask = np.ones((h, w), dtype=bool)
+    margin = max(line_thickness + 2, 1)
+    line_valid_mask[:margin, :] = False
+    line_valid_mask[-margin:, :] = False
+    line_valid_mask[:, :margin] = False
+    line_valid_mask[:, -margin:] = False
+    if mask is not None:
+        mask_bin = (mask > 0).astype(np.uint8)
+        ksize = margin * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        line_valid_mask &= cv2.erode(mask_bin, kernel, iterations=1) > 0
+
+    boundaries = set()
+    for i, layer in enumerate(layers):
+        end = layer['end']
+        if i < len(layers) - 1:
+            boundaries.add(round(end, 6))
+
+    for boundary in sorted(boundaries):
+        binary = (depth_map >= boundary).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        for cnt in contours:
+            if cv2.arcLength(cnt, True) < 50:
+                continue
+            _draw_dashed_contour(
+                line_canvas, cnt, (255, 255, 255), thickness=line_thickness,
+                valid_mask=line_valid_mask
+            )
+    # 直接按 CSV 中的点序列绘制 GM/WM 边界，避免点图 + findContours 把开放边界闭合。
+    _draw_dashed_points(line_canvas, gm_pts, (0, 255, 0), thickness=10)
+    _draw_dashed_points(line_canvas, wm_pts, (0, 0, 255), thickness=10)
+
+    # 将虚线合成到原图，仅保留 mask 内的虚线
+    layer_lines_img = orig_bgr.copy()
+    if mask is not None:
+        line_mask = (line_canvas > 0) & (np.tile(mask > 0, (3, 1, 1)).transpose(1, 2, 0))
+    else:
+        line_mask = line_canvas > 0
+    layer_lines_img[line_mask] = line_canvas[line_mask]
+    print(f"  绘制了 {len(boundaries)} 条分层线")
+
+    # -- 保存单张图像 --
     if issave:
         cv2.imwrite(f'{output_dir}\\layers_color_mask.png', layer_color_mask)
         print(f"分层颜色Mask已保存为 {output_dir}\\layers_color_mask.png")
+        cv2.imwrite(f'{output_dir}\\layers_overlay.png', overlay_img)
+        print(f"Overlay图已保存为 {output_dir}\\layers_overlay.png")
+        cv2.imwrite(f'{output_dir}\\layer_lines.png', layer_lines_img)
+        print(f"分层线图已保存为 {output_dir}\\layer_lines.png")
 
-    # # 计算每个细胞的深度
-    # depths = calculate_cell_depths(centroids_df, wm_path, gm_path)
-    # if depths is None:
-    #     return None, None
+    # -- 4图综合展示（2x2） --
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
 
-    # # 为每个 cell 分配层号
-    # cell_layers = []
-    # for d in depths:
-    #     assigned = 0
-    #     for L in layers:
-    #         if d >= L['start'] and d <= L['end']:
-    #             assigned = L['layer']
-    #             break
-    #     cell_layers.append(int(assigned))
+    axes[0, 0].imshow(cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB))
+    axes[0, 0].set_title('Original Image', fontsize=14, fontweight='bold')
+    axes[0, 0].axis('off')
 
-    # # 生成 layer_mask 和 overlay
-    # # 构建 label_id -> layer 映射
-    # label_to_layer = {}
-    # h, w = labels.shape[:2]
-    # ys = centroids_df['Y'].to_numpy()
-    # xs = centroids_df['X'].to_numpy()
-    
-    # for i, (y, x) in enumerate(zip(ys, xs)):
-    #     iy = int(round(y))
-    #     ix = int(round(x))
-    #     if 0 <= iy < h and 0 <= ix < w:
-    #         lid = int(labels[iy, ix])
-    #     else:
-    #         lid = 0
-        
-    #     if lid == 0: # 尝试邻域搜索
-    #         rr = 3
-    #         found = 0
-    #         for dy in range(-rr, rr+1):
-    #             for dx in range(-rr, rr+1):
-    #                 ny, nx = iy+dy, ix+dx
-    #                 if 0 <= ny < h and 0 <= nx < w:
-    #                     v = int(labels[ny, nx])
-    #                     if v > 0:
-    #                         lid = v
-    #                         found = 1
-    #                         break
-    #             if found: break
-        
-    #     if lid > 0 and lid not in label_to_layer:
-    #         label_to_layer[lid] = cell_layers[i]
+    axes[0, 1].imshow(cv2.cvtColor(layer_lines_img, cv2.COLOR_BGR2RGB))
+    axes[0, 1].set_title('Layer Lines (Dashed)', fontsize=14, fontweight='bold')
+    axes[0, 1].axis('off')
 
-    # layer_mask = np.zeros_like(labels, dtype=np.uint8)
-    # for lid, layerno in label_to_layer.items():
-    #     layer_mask[labels == lid] = int(layerno)
+    axes[1, 0].imshow(cv2.cvtColor(layer_color_mask, cv2.COLOR_BGR2RGB))
+    axes[1, 0].set_title('Layer Color Mask', fontsize=14, fontweight='bold')
+    axes[1, 0].axis('off')
 
-    # # 可视化
-    # if orig_img.ndim == 2:
-    #     orig_bgr = cv2.cvtColor(orig_img, cv2.COLOR_GRAY2BGR)
-    # elif orig_img.shape[2] == 4:
-    #     orig_bgr = cv2.cvtColor(orig_img, cv2.COLOR_BGRA2BGR)
-    # else:
-    #     orig_bgr = orig_img.copy()
+    axes[1, 1].imshow(cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB))
+    axes[1, 1].set_title('Overlay (Mask on Original)', fontsize=14, fontweight='bold')
+    axes[1, 1].axis('off')
 
-    # max_layer = int(layer_mask.max()) if layer_mask.max() > 0 else 1
-    # colored_layers = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # for li in range(1, max_layer + 1):
-    #     rgba = cmap((li - 1) % 10)
-    #     rgb = (np.array(rgba[:3]) * 255).astype(np.uint8)
-    #     bgr = rgb[::-1]
-    #     colored_layers[layer_mask == li] = bgr
+    plt.tight_layout()
+    if issave:
+        combined_path = os.path.join(output_dir, 'combined_visualization.png')
+        plt.savefig(combined_path, dpi=150, bbox_inches='tight')
+        print(f"综合可视化图已保存为 {combined_path}")
+        print(f"\n  输出文件:")
+        print(f"    {output_dir}\\layers_color_mask.png")
+        print(f"    {output_dir}\\layers_overlay.png")
+        print(f"    {output_dir}\\layer_lines.png")
+        print(f"    {output_dir}\\combined_visualization.png")
+    plt.show(block=True)
 
-    # alpha = 0.5
-    # blended_full = cv2.addWeighted(colored_layers, alpha, orig_bgr, 1 - alpha, 0)
-    # mask_bool = layer_mask > 0
-    # mask_3ch = np.repeat(mask_bool[:, :, np.newaxis], 3, axis=2)
-    # blended = np.where(mask_3ch, blended_full, orig_bgr)
-
-    # if issave:
-    #     cv2.imwrite('labels_with_layers.png', layer_mask)
-    #     cv2.imwrite('overlay_layers.png', blended)
-    #     print("分层结果图已保存")
 
 if __name__ == "__main__":
-    # 加载分割结果
-    centroids_df = pd.read_csv(f"{output_dir}\\nuclei_centroids.csv")
-    layers_df = f'{output_dir}\\segmented_layers.csv'
-
-    image_path = f'{input_dir}\\40x.png'
-    wm_df = f"{input_dir}\\WM_40x.csv"
-    gm_df = f"{input_dir}\\GM_40x.csv"
-
-    # 调整列顺序为 ['X','Y']（如果需要）
-    if list(centroids_df.columns[:2]) == ['Y','X']:
-        df2 = pd.DataFrame({'X': centroids_df['X'].values, 'Y': centroids_df['Y'].values})
-    else:
-        df2 = centroids_df.rename(columns={centroids_df.columns[0]:'X', centroids_df.columns[1]:'Y'}) if 'X' not in centroids_df.columns else centroids_df
-
-    assign_layers_to_mask(wm_df, gm_df, layers_df, image_path, issave=True)
+    # 测试入口
+    assign_layers_to_mask(
+        f"{input_dir}\\WM_40x.csv", f"{input_dir}\\GM_40x.csv",
+        f"{output_dir}\\segmented_layers.csv",
+        resolve_image_path(input_dir, "40x.png"),
+        issave=True,
+    )

@@ -1,0 +1,19 @@
+# cellpose_requirements.txt
+# Runtime environment for segment_large_image.py
+# Generated from: Python 3.12.3 + CUDA 12.1
+
+# python>=3.12,<3.13
+
+# --- Core segmentation ---
+cellpose==4.1.0
+torch==2.4.1+cu121          # GPU inference; pin to CUDA version matching your driver
+scikit-image==0.26.0        # regionprops for vectorized post-processing
+
+# --- I/O & image processing ---
+tifffile==2026.3.3
+opencv-python-headless==4.13.0.92   # CLAHE + image loading (no GUI deps)
+pillow==12.1.1                      # saving PNG overlays
+numpy==2.4.3
+
+# --- Output ---
+pandas==3.0.1                       # centroid CSV

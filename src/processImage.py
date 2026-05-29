@@ -2,10 +2,30 @@ import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import os
 
 # 默认输入输出路径
 input_path = "input"
 output_path = "output"
+IMAGE_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".jp2", ".j2k"
+)
+
+
+def resolve_image_path(directory, filename):
+    base = os.path.join(directory, filename)
+    if os.path.exists(base):
+        return base
+
+    stem, suffix = os.path.splitext(filename)
+    if not suffix:
+        stem = filename
+    for ext in IMAGE_EXTENSIONS:
+        for candidate_ext in (ext, ext.upper()):
+            candidate = os.path.join(directory, stem + candidate_ext)
+            if os.path.exists(candidate):
+                return candidate
+    return base
 
 def croptissue(image):
 
@@ -385,7 +405,7 @@ def splitContour(cnt, max_gap):
 
 
 if __name__ == "__main__":
-    image = cv2.imread(f"{input_path}\\4x.png", cv2.IMREAD_GRAYSCALE)
+    image = cv2.imread(resolve_image_path(input_path, "4x.png"), cv2.IMREAD_GRAYSCALE)
     # fluorescence_image = cv2.imread(f"{input_path}\\40x.png", cv2.IMREAD_GRAYSCALE)
 
     # fluorescence_image = subtractBackground(fluorescence_image, src_size=51)

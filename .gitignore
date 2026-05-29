@@ -1,3 +1,11 @@
 input/
 output/
 venv/
+Original_Data/
+__pycache__/
+venv-cellpose/
+cellposeEveluation/
+analyse/
+resultlist/
+tmp/
+.claude/
