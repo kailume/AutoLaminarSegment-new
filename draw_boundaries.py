@@ -147,7 +147,11 @@ class BoundaryDrawer:
         else:
             self._img_handle.set_data(rgb)
 
-        self.fig.canvas.draw_idle()   # full redraw → _on_draw re-caches background
+        # Invalidate cached background so _blit forces a full redraw instead of
+        # restoring the old LUT.  The draw_idle from _blit → _refresh_status will
+        # show the new LUT and re-cache _bg via _on_draw.
+        self._bg = None
+        self.fig.canvas.draw_idle()
 
     # ── event handlers ─────────────────────────────────────────────────────────
 
@@ -348,6 +352,7 @@ class BoundaryDrawer:
     def _blit(self):
         """Redraw only overlay artists — image background stays static."""
         if self._bg is None:
+            self.fig.canvas.draw_idle()
             return
         fig, ax = self.fig, self.ax
         fig.canvas.restore_region(self._bg)
