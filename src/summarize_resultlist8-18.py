@@ -18,7 +18,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import ConnectionPatch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -126,9 +126,10 @@ def load_image_rgb(path: Path) -> Image.Image:
     return img.convert("RGB")
 
 
-def load_fit_image_rgb(path: Path, max_width: int, max_height: int) -> Image.Image:
-    """加载并缩放到目标尺寸。"""
+def load_fit_image_rgb(path: Path, max_width: int, max_height: int) -> tuple[Image.Image, float]:
+    """加载并缩放到目标尺寸，返回 (image, scale)。"""
     img = Image.open(path)
+    orig_w, orig_h = img.width, img.height
     if img.mode in ("I;16", "I;16L", "I;16B", "I"):
         arr = np.array(img, dtype=np.float64)
         low, high = np.percentile(arr, [1, 99.5])
@@ -137,8 +138,68 @@ def load_fit_image_rgb(path: Path, max_width: int, max_height: int) -> Image.Ima
         else:
             arr = arr / 256.0
         img = Image.fromarray(arr.astype(np.uint8))
+        orig_w, orig_h = img.width, img.height
     img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-    return img.convert("RGB").copy()
+    scale = img.width / orig_w if orig_w > 0 else 1.0
+    return img.convert("RGB").copy(), scale
+
+
+def apply_dapi_lut(img: Image.Image) -> Image.Image:
+    """给灰度 DAPI 图像加上蓝-青色荧光 LUT（模拟显微镜 DAPI 通道）。"""
+    gray = np.array(img.convert("L"), dtype=np.float32)
+    h, w = gray.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[:, :, 2] = np.clip(gray, 0, 255).astype(np.uint8)           # Blue: 100%
+    rgb[:, :, 1] = np.clip(gray * 0.35, 0, 255).astype(np.uint8)    # Green: 35%
+    rgb[:, :, 0] = np.clip(gray * 0.05, 0, 255).astype(np.uint8)    # Red:   5%
+    return Image.fromarray(rgb)
+
+
+_NICE_BAR_LENGTHS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
+
+
+def add_scale_bar(
+    img: Image.Image,
+    um_per_px: float,
+    bar_um: float | None = None,
+    bg_color: tuple[int, int, int] | None = None,
+) -> Image.Image:
+    """在图像右下角绘制 scale bar，可指定 bar 长度(µm)和背景色。"""
+    if um_per_px <= 0:
+        return img
+
+    # 自动选长度：目标占图像宽度约 12%
+    if bar_um is None:
+        target_um = img.width * 0.12 * um_per_px
+        bar_um = min(_NICE_BAR_LENGTHS, key=lambda n: abs(target_um - n))
+    bar_px = max(10, min(int(round(bar_um / um_per_px)), img.width - 30))
+
+    margin = 14
+    bar_h = max(2, int(img.height * 0.006))
+    x2 = img.width - margin
+    x1 = x2 - bar_px
+    y0 = img.height - margin
+
+    draw = ImageDraw.Draw(img)
+    label = f"{bar_um} um"
+    bbox = draw.textbbox((0, 0), label)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tx = x1 + (bar_px - tw) / 2
+    ty = y0 - bar_h - th - 3
+
+    # 可选黑色背景
+    if bg_color is not None:
+        pad_x = 5
+        pad_y = 3
+        draw.rectangle(
+            [x1 - pad_x, ty - pad_y, x2 + pad_x, y0 + pad_y],
+            fill=bg_color,
+        )
+
+    draw.rectangle([x1, y0 - bar_h, x2, y0], fill=(255, 255, 255))
+    draw.text((tx, ty), label, fill=(255, 255, 255))
+
+    return img
 
 
 def fit_to_box_with_scale(img: Image.Image, max_width: int, max_height: int) -> tuple[Image.Image, float]:
@@ -207,8 +268,8 @@ def _draw_dashed_polyline_cv(
     points: np.ndarray,
     color: tuple[int, int, int],
     thickness: int = 2,
-    dash_len: int = 4,
-    gap_len: int = 3,
+    dash_len: int = 9,
+    gap_len: int = 5,
 ) -> None:
     pts = points.reshape(-1, 2)
     start = 0
@@ -330,7 +391,37 @@ def overlay_colored_layer_boundaries(
             _draw_horizontal_edge(base_np, np.where(label_map[h - 1, :] == idx)[0],
                                   float(h - 1), bdr_color, thickness)
 
-    return Image.fromarray(base_np)
+    # 5. 在每层左侧标注层级名称
+    base_pil = Image.fromarray(base_np)
+    draw_text = ImageDraw.Draw(base_pil)
+    # 尝试加载粗体字体
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 18)
+    except Exception:
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 18)
+        except Exception:
+            font = ImageFont.load_default()
+    for idx in range(1, len(layer_names) + 1):
+        ys = np.where(label_map == idx)[0]
+        if len(ys) < 10:
+            continue
+        y_min = int(np.min(ys))
+        y_max = int(np.max(ys))
+        # 层太薄跳过
+        if y_max - y_min < 24:
+            continue
+        label = layer_names[idx - 1]
+        bbox = draw_text.textbbox((0, 0), label, font=font)
+        th = bbox[3] - bbox[1]
+        # 层内居中，离上下边界各留一点距离
+        mid_y = (y_min + y_max) // 2
+        tx = 6
+        ty = max(y_min + 4, mid_y - th // 2)
+        ty = min(ty, y_max - th - 4)
+        draw_text.text((tx, ty), label, fill=(255, 255, 255), font=font)
+
+    return base_pil
 
 
 # ---------------------------------------------------------------------------
@@ -373,30 +464,40 @@ def make_case_figure(
     )
     dapi_bbox = (dapi_x, dapi_y, dapi_w, dapi_h)
 
-    # Col 0: GT overview
+    # 读取像素比例 (µm/pixel)
+    _, _, pixel_scale_4x = read_json_start(case_dir / "4x.json")
+    _, _, pixel_scale_40x = read_json_start(case_dir / "40x.json")
+
+    # ---- Col 0: GT overview (4x_dapi) ----
+    image_4x_dapi = apply_dapi_lut(image_4x_dapi)
     gt_overview, gt_scale = fit_to_box_with_scale(image_4x_dapi, panel_width, panel_height)
     gt_rect = scale_visible_bbox(dapi_bbox, gt_scale, gt_overview.size)
     gt_overview = draw_scaled_registered_box(gt_overview, gt_rect, color=(255, 0, 0), width=3)
+    gt_overview = add_scale_bar(gt_overview, pixel_scale_4x / gt_scale, bar_um=500)
 
-    # Col 1: GT zoom
+    # ---- Col 1: GT zoom (crop from 4x_dapi) ----
     gt_crop = crop_with_padding(image_4x_dapi, dapi_bbox)
-    gt_crop = fit_to_box(gt_crop, panel_width, panel_height)
+    gt_crop, crop_scale = fit_to_box_with_scale(gt_crop, panel_width, panel_height)
     gt_crop = overlay_colored_layer_boundaries(
         gt_crop, gt_mask_path,
         GT_MASK_LAYER_RGB, GT_BOUNDARY_COLORS_RGB,
     )
+    gt_crop = add_scale_bar(gt_crop, pixel_scale_4x / crop_scale, bar_um=300)
 
-    # Col 2: Algo overview
+    # ---- Col 2: Algo overview (4x) ----
     algo_overview, algo_scale = fit_to_box_with_scale(image_4x, panel_width, panel_height)
     algo_rect = scale_visible_bbox(dapi_bbox, algo_scale, algo_overview.size)
     algo_overview = draw_scaled_registered_box(algo_overview, algo_rect, color=(255, 0, 0), width=3)
+    algo_overview = add_scale_bar(algo_overview, pixel_scale_4x / algo_scale,
+                                  bar_um=500, bg_color=(0, 0, 0))
 
-    # Col 3: Algo zoom
-    algo_detail = load_fit_image_rgb(case_dir / "dapi.png", panel_width, panel_height)
+    # ---- Col 3: Algo zoom (40x dapi, no LUT) ----
+    algo_detail, dapi_scale = load_fit_image_rgb(case_dir / "dapi.png", panel_width, panel_height)
     algo_detail = overlay_colored_layer_boundaries(
         algo_detail, case_dir / "layers_color_mask.png",
         ALGO_MASK_LAYER_RGB, ALGO_BOUNDARY_COLORS_RGB,
     )
+    algo_detail = add_scale_bar(algo_detail, pixel_scale_40x / dapi_scale, bar_um=300)
 
     # ---- 组装 1×4 ----
     fig, axes = plt.subplots(1, 4, figsize=(20, 5.5), dpi=dpi)
