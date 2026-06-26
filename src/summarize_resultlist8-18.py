@@ -394,7 +394,6 @@ def overlay_colored_layer_boundaries(
     # 5. 在每层左侧标注层级名称
     base_pil = Image.fromarray(base_np)
     draw_text = ImageDraw.Draw(base_pil)
-    # 尝试加载粗体字体
     try:
         font = ImageFont.truetype("arialbd.ttf", 18)
     except Exception:
@@ -402,23 +401,24 @@ def overlay_colored_layer_boundaries(
             font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 18)
         except Exception:
             font = ImageFont.load_default()
+
+    left_band = min(80, w)  # 仅看左侧一列定位
+
     for idx in range(1, len(layer_names) + 1):
-        ys = np.where(label_map == idx)[0]
-        if len(ys) < 10:
+        # 只在左侧区域内找层的 y 范围
+        left_mask = label_map[:, :left_band] == idx
+        ys = np.where(left_mask)[0]
+        if len(ys) < 5:
             continue
         y_min = int(np.min(ys))
         y_max = int(np.max(ys))
-        # 层太薄跳过
         if y_max - y_min < 24:
             continue
         label = layer_names[idx - 1]
         bbox = draw_text.textbbox((0, 0), label, font=font)
         th = bbox[3] - bbox[1]
-        # 层内居中，离上下边界各留一点距离
-        mid_y = (y_min + y_max) // 2
         tx = 6
-        ty = max(y_min + 4, mid_y - th // 2)
-        ty = min(ty, y_max - th - 4)
+        ty = int(np.clip((y_min + y_max - th) / 2, y_min + 4, y_max - th - 4))
         draw_text.text((tx, ty), label, fill=(255, 255, 255), font=font)
 
     return base_pil

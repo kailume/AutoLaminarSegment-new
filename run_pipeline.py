@@ -176,6 +176,10 @@ def parse_args():
                         help=f"最终可视化缩放比例，1=不压缩，0.1=原10:1压缩。默认: PIPELINE_COMPACT_RATE={PIPELINE_COMPACT_RATE}; then layerVisualize default.")
     parser.add_argument("--depth-method", choices=["legacy", "harmonic"], default=None,
                         help=f"深度计算方式。默认: PIPELINE_DEPTH_METHOD={PIPELINE_DEPTH_METHOD}; then analyseDensity default.")
+    parser.add_argument("--refine", action="store_true",
+                        help="启用边界精炼模型（基于 depth-density 曲线回归精炼层边界）")
+    parser.add_argument("--refine-model", default="dataset/boundary_model.pkl",
+                        help="边界精炼模型路径 (default: dataset/boundary_model.pkl)")
     return parser.parse_args()
 
 
@@ -331,6 +335,66 @@ def main():
     for L in layers:
         print(f"    Layer {L['layer']:>4s}: depth=[{L['start']:.3f}, {L['end']:.3f}]"
               f"  mean_density={L['mean_density']:.2f}")
+
+    # ── Step 4.5: 边界精炼（可选）─────────────────────────
+    if args.refine:
+        print("\n[步骤4.5] 边界精炼 (curve→boundary regression)...")
+        refine_model_path = Path(args.refine_model)
+        if not refine_model_path.exists():
+            print(f"  [警告] 精炼模型不存在: {refine_model_path}，跳过")
+        else:
+            try:
+                from src.densityRefinement import DensityDrivenRefiner
+
+                refiner = DensityDrivenRefiner()
+                refiner.load(str(refine_model_path))
+
+                # 从密度剖面预测精炼边界
+                boundaries, _ = refiner.predict(
+                    os.path.basename(str(OUTPUT_DIR)) if os.path.basename(str(OUTPUT_DIR)).isdigit() else os.path.basename(str(INPUT_DIR)),
+                    every_n=5,
+                )
+                refined_layers = []
+                for i, name in enumerate(["1", "2/3", "4", "5/6"]):
+                    s = 0.0 if i == 0 else boundaries[i-1]
+                    e = boundaries[i] if i < 3 else 1.0
+                    refined_layers.append({"layer": name, "start": float(s), "end": float(e), "mean_density": 0.0})
+
+                # 输出精炼结果
+                refined_csv = OUTPUT_DIR / "segmented_layers_refined.csv"
+                pd.DataFrame(refined_layers).to_csv(refined_csv, index=False)
+                print(f"  [✓] 精炼分层结果已保存: {refined_csv}")
+
+                print("\n  精炼分层结果摘要:")
+                for L in refined_layers:
+                    print(f"    Layer L{L['layer']:>4s}: depth=[{L['start']:.3f}, {L['end']:.3f}]")
+
+                # 生成精炼结果的图像可视化（独立子目录，不覆盖 coarse 可视化）
+                if IMG_PATH.exists():
+                    refined_vis_dir = OUTPUT_DIR / "refined_visualization"
+                    refined_vis_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"\n  生成精炼结果可视化 -> {refined_vis_dir}")
+                    try:
+                        assign_layers_to_mask(
+                            str(wm_path), str(gm_path),
+                            str(refined_csv),
+                            str(IMG_PATH),
+                            issave=True,
+                            save_dir=str(refined_vis_dir),
+                            mask_img=mask_img,
+                            compact_rate=compact_rate,
+                        )
+                        # 也在主目录生成简化的边界线对比图
+                        print(f"  [✓] 精炼可视化已保存: {refined_vis_dir}/")
+                    except Exception as ve:
+                        print(f"  [警告] 精炼可视化失败: {ve}")
+
+            except ImportError as e:
+                print(f"  [警告] 加载边界精炼模块失败: {e}")
+            except Exception as e:
+                print(f"  [警告] 边界精炼失败: {e}")
+                import traceback
+                traceback.print_exc()
 
     # ── Step 5: 图像可视化（可选）────────────────────────
     if IMG_PATH.exists():

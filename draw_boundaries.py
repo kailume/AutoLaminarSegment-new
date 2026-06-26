@@ -503,6 +503,9 @@ def main():
         Path(args.output) if args.output
         else image_path.parent / f"{image_path.stem}_boundaries.csv"
     )
+    # If output is a directory, append a default filename
+    if save_path.suffix == "" or save_path.exists() and save_path.is_dir():
+        save_path = save_path / f"{image_path.stem}_boundaries.csv"
 
     print(f"Loading: {image_path}")
     image = load_display_image(image_path)

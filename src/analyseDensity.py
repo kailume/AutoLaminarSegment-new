@@ -811,3 +811,171 @@ def segmentLayer_peak_based(avg_density, depth_list, sigma=2, merge_layer23=True
         )
 
     return layers
+
+
+def export_cell_features(
+    wm, gm, cell,
+    depth_method=None,
+    kde_bandwidth="scott",
+    harmonic_max_dim=None,
+    groundtruth_png=None,
+):
+    """
+    为每个细胞导出完整特征集，用于 SVM 精细化分层训练。
+
+    参数:
+        wm, gm, cell: 与 analyze() 相同的 WM/GM 边界和细胞数据。
+        depth_method: 深度计算方法 ("legacy" / "harmonic")。
+        kde_bandwidth: KDE 带宽参数。
+        harmonic_max_dim: harmonic 深度场网格最长边。
+        groundtruth_png: ground truth 层掩码 PNG 路径。若提供，为每个细胞提取真实层标签。
+
+    返回:
+        pd.DataFrame，每个细胞一行，包含:
+            cell_id, centroid_x, centroid_y, area_px, area_um2,
+            depth, density, dist_to_gm, dist_to_wm,
+            local_cell_count, depth_squared, depth_x_centroid,
+            layer_label (若 groundtruth_png 提供), coarse_layer.
+    """
+    # -- 1. 加载原始细胞数据（保留所有列） --
+    if isinstance(cell, str):
+        cell_df = pd.read_csv(cell)
+    else:
+        cell_df = cell.copy()
+
+    # 统一列名
+    cols_lower = {c.lower(): c for c in cell_df.columns}
+
+    x_col = cols_lower.get("x") or cols_lower.get("centroid_x")
+    y_col = cols_lower.get("y") or cols_lower.get("centroid_y")
+    if x_col is None or y_col is None:
+        if "X" in cell_df.columns and "Y" in cell_df.columns:
+            x_col, y_col = "X", "Y"
+        else:
+            raise ValueError(f"Cannot find coordinate columns in {list(cell_df.columns)}")
+
+    # 坐标列重命名
+    rename_map = {x_col: "centroid_x", y_col: "centroid_y"}
+    for col in ["cell_id", "area_px", "area_um2"]:
+        if col in cols_lower and cols_lower[col] != col:
+            rename_map[cols_lower[col]] = col
+    cell_df = cell_df.rename(columns=rename_map)
+
+    # 确保必要的列存在
+    for col in ["centroid_x", "centroid_y"]:
+        if col not in cell_df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    # 构建 XY DataFrame 供下游函数使用
+    cells_xy = cell_df[["centroid_x", "centroid_y"]].copy()
+    cells_xy.columns = ["X", "Y"]
+
+    # -- 2. 边界数据 --
+    boundary_wm = _ensure_boundary_dataframe(wm)
+    boundary_gm = _ensure_boundary_dataframe(gm)
+
+    if depth_method is None:
+        depth_method = DEPTH_METHOD
+    depth_method = str(depth_method).lower()
+    hmax = HARMONIC_MAX_DIM if harmonic_max_dim is None else harmonic_max_dim
+
+    # -- 3. 计算深度 --
+    if depth_method == "legacy":
+        depth = _nearest_boundary_depths(boundary_wm, boundary_gm, cells_xy)
+    elif depth_method == "harmonic":
+        depth = _harmonic_boundary_depths(boundary_wm, boundary_gm, cells_xy, max_dim=hmax)
+    else:
+        raise ValueError(f"Unknown depth_method: {depth_method}")
+
+    # -- 4. 计算 KDE 密度 --
+    density = _kde_density(cells_xy, bandwidth=kde_bandwidth)
+
+    # -- 5. 计算到 GM/WM 边界的距离 --
+    cell_points = cells_xy[["X", "Y"]].to_numpy(dtype=float)
+    wm_points = boundary_wm[["x", "y"]].to_numpy(dtype=float)
+    gm_points = boundary_gm[["x", "y"]].to_numpy(dtype=float)
+    dist_to_wm, _ = cKDTree(wm_points).query(cell_points, k=1)
+    dist_to_gm, _ = cKDTree(gm_points).query(cell_points, k=1)
+
+    # -- 6. 计算局部细胞计数 (半径 100 um, 约 200 像素) --
+    # 使用 return_length=True 高效获取所有点的邻域计数
+    LOCAL_RADIUS = 200.0  # 像素, ~100 um at 0.5 um/px
+    tree = cKDTree(cell_points)
+    local_cell_count = tree.query_ball_point(cell_points, LOCAL_RADIUS, return_length=True)
+
+    # -- 7. 构建特征 DataFrame --
+    feature_df = pd.DataFrame({
+        "cell_id": cell_df.get("cell_id", np.arange(len(cell_df)) + 1),
+        "centroid_x": cell_df["centroid_x"].values,
+        "centroid_y": cell_df["centroid_y"].values,
+        "area_px": cell_df.get("area_px", 0),
+        "area_um2": cell_df.get("area_um2", 0.0),
+        "depth": depth,
+        "density": density,
+        "dist_to_gm": dist_to_gm,
+        "dist_to_wm": dist_to_wm,
+        "local_cell_count": local_cell_count,
+    })
+
+    # 衍生特征
+    feature_df["depth_squared"] = feature_df["depth"] ** 2
+    feature_df["depth_x_centroid"] = feature_df["depth"] * feature_df["centroid_x"]
+
+    # -- 8. 从 groundtruth.png 提取真实层标签（若提供）--
+    feature_df["layer_label"] = ""
+    if groundtruth_png and os.path.isfile(str(groundtruth_png)):
+        try:
+            import cv2 as _cv2
+            gt_img = _cv2.imread(str(groundtruth_png))
+            if gt_img is None:
+                print(f"[export_cell_features] 警告: 无法读取 {groundtruth_png}")
+            else:
+                print(f"[export_cell_features] 从 {groundtruth_png} 提取层标签...")
+                # GT 颜色映射 (BGR)
+                # 从 output/harmonic_depth_validation/ 各样本 GT 图中提取
+                # 按像素数排序: L5/6(最多) > L2/3 > L4 > L1(最少)
+                gt_color_map = {
+                    (0, 0, 255): "1",       # Red -> L1 (最薄层, 最少像素)
+                    (127, 127, 0): "2/3",    # Teal -> L2/3
+                    (0, 255, 255): "4",      # Yellow -> L4
+                    (255, 127, 127): "5/6",  # Pink -> L5/6 (最厚层, 最多像素)
+                }
+
+                # 批量颜色匹配 (向量化)
+                xs = np.round(feature_df["centroid_x"].values).astype(int)
+                ys = np.round(feature_df["centroid_y"].values).astype(int)
+                h_img, w_img = gt_img.shape[:2]
+                in_bounds = (xs >= 0) & (xs < w_img) & (ys >= 0) & (ys < h_img)
+
+                # 只处理图内细胞
+                valid_idx = np.where(in_bounds)[0]
+                valid_x = xs[valid_idx]
+                valid_y = ys[valid_idx]
+                pixel_bgr = gt_img[valid_y, valid_x, :].astype(int)  # (N, 3)
+
+                # 预分配标签数组
+                labels = np.full(len(feature_df), "", dtype=object)
+                assigned = np.zeros(len(valid_idx), dtype=bool)
+
+                for (ref_b, ref_g, ref_r), lyr in gt_color_map.items():
+                    match = (
+                        (np.abs(pixel_bgr[:, 0] - ref_b) <= 15) &
+                        (np.abs(pixel_bgr[:, 1] - ref_g) <= 15) &
+                        (np.abs(pixel_bgr[:, 2] - ref_r) <= 15) &
+                        ~assigned
+                    )
+                    labels[valid_idx[match]] = lyr
+                    assigned |= match
+
+                feature_df["layer_label"] = labels
+                n_labeled = int(assigned.sum())
+                print(f"  -> {n_labeled}/{len(feature_df)} 个细胞获得真实层标签")
+        except ImportError:
+            print("[export_cell_features] 警告: 需要 opencv-python 读取 ground truth PNG")
+        except Exception as e:
+            print(f"[export_cell_features] 提取层标签失败: {e}")
+
+    # -- 9. coarse_layer 暂设为空，后续由 pipeline 填充 --
+    feature_df["coarse_layer"] = ""
+
+    return feature_df
