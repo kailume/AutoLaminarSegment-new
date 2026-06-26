@@ -334,26 +334,38 @@ def _plot_comparison(coarse, refined, gt, sample, save_dir):
     上方三图: 用 Nature 调色板映射层颜色
     下方三图: 绿色=比GT多(过分割), 红色=比GT少(欠分割)
     """
-    # Nature/Science 风格配色 (RGB, 低饱和度高对比度)
-    NATURE_CMAP = {
-        "L1": (0.329, 0.180, 0.561),    # 紫
-        "L2/3": (0.216, 0.596, 0.420),  # 绿
-        "L4": (0.878, 0.475, 0.212),    # 橙
-        "L5/6": (0.204, 0.490, 0.737),  # 蓝
-        "BG": (0.95, 0.95, 0.95),       # 浅灰背景
+    # 三套不同的 Nature 风格配色 (RGB), 每栏使用不同调色板
+    # Coarse: Nature Reviews 风格 — 偏冷色调
+    PALETTE_COARSE = {
+        "L1": (0.302, 0.686, 0.639), "L2/3": (1.000, 0.498, 0.314),
+        "L4": (0.404, 0.627, 0.820), "L5/6": (0.573, 0.404, 0.718),
+        "BG": (0.97, 0.97, 0.97),
     }
+    # Refined: Nature Communications 风格 — 偏暖色调
+    PALETTE_REFINED = {
+        "L1": (0.729, 0.404, 0.784), "L2/3": (0.302, 0.686, 0.639),
+        "L4": (0.957, 0.541, 0.396), "L5/6": (0.506, 0.780, 0.506),
+        "BG": (0.97, 0.97, 0.97),
+    }
+    # GT: Nature Genetics 风格 — 经典学术配色
+    PALETTE_GT = {
+        "L1": (0.894, 0.565, 0.196), "L2/3": (0.565, 0.792, 0.565),
+        "L4": (0.592, 0.639, 0.788), "L5/6": (0.573, 0.404, 0.718),
+        "BG": (0.97, 0.97, 0.97),
+    }
+
     LAYER_ORDER = ["L1", "L2/3", "L4", "L5/6"]
 
-    def _remap_to_nature(bgr_img):
-        """将 BGR 层掩码重映射为 Nature 配色 RGB。"""
+    def _remap(bgr_img, palette):
+        """用指定调色板重映射层颜色。"""
         h, w = bgr_img.shape[:2]
-        out = np.full((h, w, 3), NATURE_CMAP["BG"], dtype=np.float32)
+        out = np.full((h, w, 3), palette["BG"], dtype=np.float32)
         for layer in LAYER_ORDER:
             color_bgr = ALGO_COLORS.get(layer)
             if color_bgr is None:
                 continue
             mask = _extract_color_mask(bgr_img, color_bgr, COLOR_TOL) > 0
-            rgb = NATURE_CMAP[layer]
+            rgb = palette[layer]
             for c in range(3):
                 out[mask, c] = rgb[c]
         return out
@@ -388,12 +400,12 @@ def _plot_comparison(coarse, refined, gt, sample, save_dir):
 
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
 
-    # ── 上方: 三栏 Nature 配色 ──
+    # ── 上方: 三栏各自独立 Nature 配色 ──
     titles = ["Coarse", "Refined", "Ground Truth"]
+    palettes = [PALETTE_COARSE, PALETTE_REFINED, PALETTE_GT]
     imgs = [coarse, refined if refined is not None else coarse, gt]
-    for idx, (ax, img, title) in enumerate(zip(axes[0], imgs, titles)):
-        nature_img = _remap_to_nature(img)
-        ax.imshow(nature_img)
+    for idx, (ax, img, title, pal) in enumerate(zip(axes[0], imgs, titles, palettes)):
+        ax.imshow(_remap(img, pal))
         ax.set_title(title, fontsize=15, fontweight="bold", pad=8)
         ax.axis("off")
 
